@@ -1,0 +1,582 @@
+#!/usr/bin/env python3
+"""Selftest for the measure package — SCANNED_ARTIFACTS_CANNOT_LIE_1.
+
+⭐ WHY THIS TEST EXISTS AT ALL. The rule the whole item rests on is
+*"validate the instrument against a case whose answer you already know."*
+An instrument that enforces that rule for everyone else and is not itself
+validated is the joke writing itself. So this file asks questions whose answers
+were established by hand, and fails if the new path returns a plausible wrong
+number — which is precisely what the seven old instruments did.
+
+The cases fall into two halves:
+
+  * **synthetic** — a tiny DefDump built in a temp dir, holding a deliberate
+    filename collision. These run anywhere, with no game and no live dump.
+  * **live** — asked of the real defs.sqlite if one exists, and SKIPPED with a
+    line saying so if it does not. A skip is not a pass and is not printed as one.
+
+    python3 skills/measuring-large-artifacts/scripts/selftest_measure.py
+"""
+import json
+import os
+import shutil
+import sys
+import tempfile
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)          # this skill's scripts/ dir holds the package
+
+from measure import artifacts                                      # noqa: E402
+from measure.dumpdb import (                                       # noqa: E402
+    DumpDB, DB_NAME, build, default_dump_dir, iter_defs,
+)
+from measure.result import (                                       # noqa: E402
+    Measured, Refused, Report, Unmeasured, UnmeasuredError,
+)
+
+PASS, FAIL, SKIP = [], [], []
+
+
+def case(name, fn):
+    try:
+        fn()
+        PASS.append(name)
+        print("ok    %s" % name)
+    except _Skip as e:
+        SKIP.append(name)
+        print("skip  %s\n        %s" % (name, e))
+    except AssertionError as e:
+        FAIL.append(name)
+        print("FAIL  %s\n        %s" % (name, e))
+
+
+class _Skip(Exception):
+    pass
+
+
+# --------------------------------------------------------------------------
+# a synthetic DefDump, built to contain the exact failure that lost 824 defs
+# --------------------------------------------------------------------------
+
+def make_dump(tmp):
+    """Two types share the simple name `ThingDef`; one overwrites the other.
+
+    Verse.ThingDef wins the file. Mod.ThingDef declared 3 defs in the manifest
+    and has nowhere to live. That is the 2026-08-21 incident in miniature.
+    """
+    defs_dir = os.path.join(tmp, "defs")
+    os.makedirs(defs_dir)
+
+    def write(fname, def_type, names, full=None, extra=None):
+        body = []
+        for i, n in enumerate(names):
+            d = {
+                "defName": n, "defType": def_type, "defTypeFull": full or def_type,
+                "label": n.lower(), "shortHash": 1000 + i,
+                "modName": "Core", "packageId": "ludeon.rimworld",
+                "fields": extra.get(n, {}) if extra else {},
+            }
+            if extra and n in (extra.get("_is") or {}):
+                d["is"] = extra["_is"][n]
+            body.append(d)
+        obj = {"defType": def_type, "defTypeFull": full or def_type,
+               "defs": body, "count": len(body)}
+        with open(os.path.join(defs_dir, fname), "w", encoding="utf-8") as fh:
+            json.dump(obj, fh, separators=(",", ":"))
+
+    write("ThingDef.json", "ThingDef", ["Gun_A", "Gun_B", "Rock"],
+          full="Verse.ThingDef",
+          extra={"Gun_A": {"weaponTags": ["Gun", "SimpleGun"]},
+                 "Gun_B": {"weaponTags": ["Gun"]},
+                 "Rock": {},
+                 "_is": {"Gun_A": {"weapon": True, "apparel": False},
+                         "Gun_B": {"weapon": True, "apparel": False},
+                         "Rock": {"weapon": False, "apparel": False}}})
+    write("BiomeDef.json", "BiomeDef", ["Desert", "Tundra"])
+    write("EmptyDef.json", "EmptyDef", [])
+
+    # ⚠️ Written as RAW TEXT, not json.dump, because the failure being
+    # reproduced IS a duplicate key — and no Python dict can hold one.
+    # defCounts declares AbilityDef three times exactly as the real manifest
+    # does: 612 defs written first, then 18, then 0, each overwriting the last.
+    manifest_text = (
+        '{"tool":"RimDefDump","toolVersion":"1.0","mode":"all",'
+        '"capturedUtc":"2026-08-21T00:00:00Z","gameVersion":"1.6.test",'
+        '"modCount":2,'
+        '"mods":[{"loadOrder":1,"name":"Core","packageId":"ludeon.rimworld"},'
+        '{"loadOrder":2,"name":"Mod","packageId":"some.mod"}],'
+        '"defCounts":{"ThingDef":3,"BiomeDef":2,"EmptyDef":0,'
+        '"AbilityDef":612,"AbilityDef":18,"AbilityDef":0}}'
+    )
+    with open(os.path.join(tmp, "manifest.json"), "w", encoding="utf-8") as fh:
+        fh.write(manifest_text)
+    # AbilityDef.json exists and is EMPTY — the last writer won the file too.
+    write("AbilityDef.json", "AbilityDef", [])
+    return tmp
+
+
+def synthetic_db():
+    tmp = tempfile.mkdtemp(prefix="measure_st_")
+    make_dump(tmp)
+    build(tmp)
+    return tmp, DumpDB(os.path.join(tmp, DB_NAME))
+
+
+# --------------------------------------------------------------------------
+# the three types are not interchangeable — this is the whole design
+# --------------------------------------------------------------------------
+
+def t_measured_zero_is_not_unmeasured():
+    """`0` must be a real answer and `ok`. Truth-testing the value is the bug."""
+    m = Measured(value=0, instrument="t", artifact="EmptyDef")
+    assert m.ok, "Measured(0) must be ok"
+    assert m.unwrap() == 0
+    assert m.line().startswith("MEASURED 0"), m.line()
+    u = Unmeasured(reason="never captured", artifact="EmptyDef")
+    assert not u.ok
+    assert u.line().startswith("UNMEASURED"), u.line()
+    assert not hasattr(u, "value"), "Unmeasured must not carry a value at all"
+
+
+def t_unwrap_raises_rather_than_returning_a_number():
+    try:
+        Unmeasured(reason="r", artifact="a").unwrap()
+    except UnmeasuredError:
+        return
+    raise AssertionError("Unmeasured.unwrap() returned instead of raising")
+
+
+def t_a_report_refuses_to_total_across_an_unmeasured_row():
+    """Summing over a partial capture is how a gap becomes a confident number."""
+    r = Report()
+    r.add(Measured(value=5, instrument="t", artifact="A"))
+    r.add(Unmeasured(reason="absent", artifact="B"))
+    tot = r.total()
+    assert not tot.ok, "a total was produced across an unmeasured subject: %s" % tot.line()
+    assert "B" in tot.line(), tot.line()
+    r2 = Report()
+    r2.add(Measured(value=5, instrument="t", artifact="A"))
+    r2.add(Measured(value=7, instrument="t", artifact="B"))
+    assert r2.total().unwrap() == 12
+
+
+def t_every_refusal_names_the_right_instrument():
+    """A refusal with no cheap alternative is an obstacle, and gets routed around."""
+    for art in artifacts.REGISTRY:
+        assert art.instrument, "%s has no instrument" % art.kind
+        txt = artifacts.refusal_text(art, "grep", "x")
+        assert art.instrument in txt, "%s refusal does not name its instrument" % art.kind
+        assert "Use instead" in txt
+
+
+# --------------------------------------------------------------------------
+# the synthetic dump — the 824-def loss, reproduced and then caught
+# --------------------------------------------------------------------------
+
+def t_a_shadowed_type_reads_unmeasured_not_zero():
+    """THE case. AbilityDef declared 612, no file holds it. It must not read 0."""
+    tmp, db = synthetic_db()
+    try:
+        got = db.count("AbilityDef")
+        assert not got.ok, (
+            "a def type the dump never wrote returned a NUMBER: %s — this is "
+            "exactly the 824-def loss, and the schema was supposed to make it "
+            "impossible" % got.line())
+        assert "612" in got.line(), got.line()
+        assert got.line().startswith("UNMEASURED"), got.line()
+        cov = dict(db.sql("SELECT def_type, coverage FROM capture"))
+        assert cov["AbilityDef"] in ("absent", "shadowed"), cov["AbilityDef"]
+    finally:
+        db.close()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def t_a_genuinely_empty_type_reads_measured_zero():
+    """The other half of the same property: real zero must still be answerable."""
+    tmp, db = synthetic_db()
+    try:
+        got = db.count("EmptyDef")
+        assert got.ok, "a captured type with no defs must read MEASURED 0: %s" % got.line()
+        assert got.unwrap() == 0
+    finally:
+        db.close()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def t_counts_match_the_json_they_came_from():
+    tmp, db = synthetic_db()
+    try:
+        assert db.count("ThingDef").unwrap() == 3
+        assert db.count("BiomeDef").unwrap() == 2
+        rep = db.verify_against_json(tmp)
+        assert not rep.unmeasured, rep.text()
+    finally:
+        db.close()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def t_tags_are_a_join_not_a_hand_built_index():
+    tmp, db = synthetic_db()
+    try:
+        assert db.tag("Gun").unwrap() == 2
+        assert db.tag("SimpleGun").unwrap() == 1
+        dead = db.tag("NoSuchTag")
+        assert not dead.ok, (
+            "a tag no def carries returned a number; it must refuse, because a "
+            "Cherry Picker cut NEUTERS a def rather than deleting it: %s" % dead.line())
+        assert isinstance(dead, Refused), dead.line()
+    finally:
+        db.close()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def t_engine_computed_flags_survive_the_round_trip():
+    """The `is` block is C# logic, not XML. Losing it is Cause B all over."""
+    tmp, db = synthetic_db()
+    try:
+        assert db.flag("weapon").unwrap() == 2
+        assert db.flag("weapon", value="false").unwrap() == 1
+        assert not db.flag("nosuchflag").ok
+    finally:
+        db.close()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def t_provenance_says_what_the_answer_is_an_answer_about():
+    tmp, db = synthetic_db()
+    try:
+        assert db.prov["mod_count"] == "2"
+        assert len(db.prov["modlist_fingerprint"]) == 16
+        assert db.prov["captured_utc"] == "2026-08-21T00:00:00Z"
+        assert "mods=2" in db.count("ThingDef").line(), db.count("ThingDef").line()
+    finally:
+        db.close()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def t_fingerprint_is_order_independent_but_membership_sensitive():
+    from measure.dumpdb import modlist_fingerprint as fp
+    a = [{"packageId": "x"}, {"packageId": "y"}]
+    assert fp(a) == fp(list(reversed(a))), "load order changed the fingerprint"
+    assert fp(a) != fp(a + [{"packageId": "z"}]), "an added mod did not change it"
+
+
+# --------------------------------------------------------------------------
+# the registry, shared by the library and the hook
+# --------------------------------------------------------------------------
+
+def t_classify_recognises_every_artifact_we_have_burned_on():
+    cases = {
+        "/mnt/c/Users/Mandrake/AppData/LocalLow/Ludeon Studios/RimWorld by "
+        "Ludeon Studios/DefDump/defs/ThingDef.json": "defdump",
+        "C:\\Users\\x\\Saves\\Ash.rws": "savegame",
+        "world/ASHKARR_WORLDMAP_tiles.csv": "worldcsv",
+        "/x/y/Player.log": "playerlog",
+        "src/x/1.6/Assemblies/JawaBench.dll": "assembly",
+    }
+    for path, kind in cases.items():
+        got = artifacts.classify(path)
+        assert got is not None, "unclassified: %s" % path
+        assert got.kind == kind, "%s -> %s, wanted %s" % (path, got.kind, kind)
+    assert artifacts.classify("src/RimMandrake/measure/cli.py") is None
+
+
+def t_the_two_formats_we_do_not_own_are_marked_as_such():
+    """No format work is possible on the .rws or a third-party DLL, ever."""
+    by = {a.kind: a for a in artifacts.REGISTRY}
+    assert by["savegame"].ours is False
+    assert by["assembly"].ours is False
+    assert by["defdump"].ours is True
+
+
+# --------------------------------------------------------------------------
+# the CSV instrument — grep counts the header, this does not
+# --------------------------------------------------------------------------
+
+def t_csv_count_excludes_the_header():
+    tmp = tempfile.mkdtemp(prefix="measure_csv_")
+    try:
+        p = os.path.join(tmp, "t.csv")
+        open(p, "w", encoding="utf-8").write(
+            "tile,biome\n1,Desert\n2,Desert\n3,Tundra\n")
+        sys.path.insert(0, HERE)
+        from measure import cli
+        import io
+        import contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            cli.main(["csv", p, "--where", "biome=Desert"])
+        line = buf.getvalue().strip()
+        assert line.startswith("MEASURED 2 "), line
+        assert "3 data rows" in line, line
+        # and the word "biome" appears in the header, which grep would count
+        assert open(p, encoding="utf-8").read().count("Desert") == 2
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+# --------------------------------------------------------------------------
+# live — only if a real db has been built
+# --------------------------------------------------------------------------
+
+def _live():
+    p = os.path.join(default_dump_dir(), DB_NAME)
+    if not os.path.exists(p):
+        raise _Skip("no %s yet — run `measure build` (this is a SKIP, not a pass)" % p)
+    return DumpDB(p)
+
+
+def t_live_abilitydef_is_the_known_wrong_answer_and_is_caught():
+    """On the CURRENT dump, taken with the pre-d7cf154 dumper, AbilityDef is a
+    known casualty: the manifest declares it and no file carries it. The old
+    path said 0. Anything but UNMEASURED here is a regression."""
+    db = _live()
+    try:
+        declared = db.sql(
+            "SELECT declared_count, coverage FROM capture WHERE def_type='AbilityDef'")
+        if not declared:
+            raise _Skip("this capture does not declare AbilityDef")
+        dc, cov = declared[0]
+        got = db.count("AbilityDef")
+        if cov == "complete":
+            raise _Skip("this dump was taken with the FIXED dumper — AbilityDef "
+                        "is captured, so the collision case cannot be exercised")
+        assert not got.ok, (
+            "AbilityDef returned a number on a dump that never captured it: %s"
+            % got.line())
+    finally:
+        db.close()
+
+
+def t_live_thingdef_matches_the_manifest():
+    db = _live()
+    try:
+        got = db.count("ThingDef")
+        assert got.ok, got.line()
+        dc = db.sql("SELECT declared_count FROM capture WHERE def_type='ThingDef'")[0][0]
+        assert got.unwrap() == dc, "sqlite %s vs manifest %s" % (got.unwrap(), dc)
+        assert got.unwrap() > 20000, "implausibly few ThingDefs: %s" % got.unwrap()
+    finally:
+        db.close()
+
+
+def t_live_a_count_costs_under_100_tokens():
+    """Goal 3, measured rather than asserted: one line, and a short one."""
+    db = _live()
+    try:
+        line = db.count("ThingDef").line()
+        assert "\n" not in line, "a count printed more than one line"
+        assert len(line) < 400, "%d chars is more than a count should cost" % len(line)
+    finally:
+        db.close()
+
+
+def t_a_plain_json_load_of_the_manifest_would_lose_the_evidence():
+    """🔴 THE REGRESSION GUARD. Do not "simplify" read_manifest to json.load.
+
+    The first cut of this module did exactly that, passed 16/16, and answered
+    `MEASURED 0 AbilityDef` — reproducing the very failure it was written to
+    prevent. The duplicate keys are the ONLY surviving evidence that 824 defs
+    were written and overwritten, and json.load destroys them at parse time.
+    """
+    from measure.dumpdb import read_manifest, collision_report
+    tmp = tempfile.mkdtemp(prefix="measure_dup_")
+    try:
+        make_dump(tmp)
+        path = os.path.join(tmp, "manifest.json")
+
+        naive = json.load(open(path, encoding="utf-8"))
+        assert naive["defCounts"]["AbilityDef"] == 0, (
+            "the fixture no longer reproduces the failure — it must hold a "
+            "duplicate key whose LAST value is the misleading one")
+
+        _, order = read_manifest(path)
+        assert order["AbilityDef"] == [612, 18, 0], order.get("AbilityDef")
+        coll, lost = collision_report(order)
+        assert set(coll) == {"AbilityDef"}, coll
+        assert lost == 630, lost
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def t_agreement_between_corrupted_sources_is_not_completeness():
+    """All three sources say 0 for AbilityDef, and all three are wrong together.
+
+    The file's trailing count, the manifest's last value, and the parsed rows
+    agree exactly — because a filename collision corrupts all three identically.
+    Coverage must NOT read `complete` on that agreement.
+    """
+    tmp, db = synthetic_db()
+    try:
+        cov, loaded, fc, dc = db.sql(
+            "SELECT coverage, loaded_count, file_count, declared_count "
+            "FROM capture WHERE def_type='AbilityDef'")[0]
+        assert (loaded, fc, dc) == (0, 0, 0), (loaded, fc, dc)
+        assert cov == "shadowed", (
+            "three corrupted sources agreed on 0 and coverage read %r" % cov)
+    finally:
+        db.close()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def t_live_the_824_defs_are_found_offline_with_no_game():
+    """The real dump, the real number, no RimWorld and no new DLL required."""
+    from measure.dumpdb import read_manifest, collision_report
+    path = os.path.join(default_dump_dir(), "manifest.json")
+    if not os.path.exists(path):
+        raise _Skip("no live dump at %s" % path)
+    _, order = read_manifest(path)
+    coll, lost = collision_report(order)
+    if not coll:
+        raise _Skip("this dump has no collisions — taken with the FIXED dumper")
+    assert lost == 824, (
+        "the collision loss is %d, not the 824 established by hand on "
+        "2026-08-21; one of the two numbers is wrong and it matters which" % lost)
+    assert len(coll) == 13, len(coll)
+    assert coll["AbilityDef"] == [612, 18, 0], coll["AbilityDef"]
+
+
+def t_a_stale_db_refuses_every_answer():
+    """A re-captured dump must not be answered from the old db.
+
+    🔑 Fingerprint, not timestamp: the check is on the manifest's own
+    capturedUtc and the mod-set hash, not on any file's mtime.
+    """
+    tmp, db = synthetic_db()
+    try:
+        assert db.stale is None, db.stale
+        db.close()
+        # re-capture: same defs, new timestamp
+        text = open(os.path.join(tmp, "manifest.json"), encoding="utf-8").read()
+        open(os.path.join(tmp, "manifest.json"), "w", encoding="utf-8").write(
+            text.replace("2026-08-21T00:00:00Z", "2026-08-22T09:00:00Z"))
+        db = DumpDB(os.path.join(tmp, DB_NAME))
+        assert db.stale, "a re-captured dump did not read as stale"
+        for m in (db.count("ThingDef"), db.get("Gun_A"),
+                  db.tag("Gun"), db.flag("weapon")):
+            assert not m.ok, "a stale db answered with a number: %s" % m.line()
+            assert "stale" in m.line(), m.line()
+    finally:
+        db.close()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def t_a_mod_list_change_makes_the_db_stale_too():
+    tmp, db = synthetic_db()
+    try:
+        db.close()
+        text = open(os.path.join(tmp, "manifest.json"), encoding="utf-8").read()
+        open(os.path.join(tmp, "manifest.json"), "w", encoding="utf-8").write(
+            text.replace('"packageId":"some.mod"', '"packageId":"other.mod"'))
+        db = DumpDB(os.path.join(tmp, DB_NAME))
+        assert db.stale and "mod set" in db.stale, db.stale
+    finally:
+        db.close()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def t_an_archived_db_whose_dump_is_gone_is_not_stale():
+    """Deleting the source dump must not make its record unreadable."""
+    tmp, db = synthetic_db()
+    try:
+        db.close()
+        os.remove(os.path.join(tmp, "manifest.json"))
+        db = DumpDB(os.path.join(tmp, DB_NAME))
+        assert db.stale is None, db.stale
+        assert db.count("ThingDef").unwrap() == 3
+    finally:
+        db.close()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def t_live_a_collision_that_lost_nothing_is_not_refused():
+    """8 names lost defs; 5 collided with an empty loser and lost none.
+
+    Refusing to answer a question that HAS a correct answer is the unearned
+    refusal the analysis warned would get the whole tool routed around. The
+    split is pinned because the 8 are exactly the 824.
+    """
+    db = _live()
+    try:
+        summary = db.coverage_summary()
+        if not summary.get("shadowed") and not summary.get("ambiguous"):
+            raise _Skip("this dump has no collisions — taken with the FIXED dumper")
+        assert summary.get("shadowed") == 8, summary
+        assert summary.get("ambiguous") == 5, summary
+        lost = int(db.prov["defs_lost_to_collision"])
+        assert lost == 824, lost
+        # a shadowed name refuses; an ambiguous one answers and says why
+        assert not db.count("AbilityDef").ok
+        amb = db.count("SymbolDef")
+        assert amb.ok and amb.unwrap() == 9099, amb.line()
+        assert "owning type is unrecorded" in amb.line(), amb.line()
+    finally:
+        db.close()
+
+
+def t_an_orphan_def_type_is_refused_and_its_defs_never_load():
+    """🔴 defs/ ACCUMULATES. A file for a type this load did not have is a
+    leftover, and its defNames must never enter the index.
+
+    Measured 2026-08-21 on the live dump: all 19 undeclared files were 126-243
+    HOURS older than the manifest, while every declared file was written within
+    17.8 seconds of it. They are stale, not a gap in the capture — and this
+    module reported them as MEASURED for an hour before that was checked.
+
+    The rule is `skills/rimworld-modding/scripts/validate_patch.py`'s, from
+    2026-08-13: a dead defName in the index makes a patch that references a
+    REMOVED def validate clean. Fail-toward-success.
+    """
+    tmp = tempfile.mkdtemp(prefix="measure_orph_")
+    try:
+        make_dump(tmp)
+        # a type the manifest never declares — a leftover from a removed mod
+        defs_dir = os.path.join(tmp, "defs")
+        with open(os.path.join(defs_dir, "DeadModDef.json"), "w",
+                  encoding="utf-8") as fh:
+            json.dump({"defType": "DeadModDef", "count": 1, "defs": [
+                {"defName": "GhostFromARemovedMod", "defType": "DeadModDef",
+                 "fields": {}}]}, fh)
+        build(tmp)
+        db = DumpDB(os.path.join(tmp, DB_NAME))
+        try:
+            got = db.count("DeadModDef")
+            assert not got.ok, "an orphan type returned a number: %s" % got.line()
+            assert "orphan" in got.line(), got.line()
+            ghost = db.get("GhostFromARemovedMod")
+            assert not ghost.ok, (
+                "a defName from a REMOVED mod is in the index — this is the "
+                "fail-toward-success bug validate_patch.py guards against: %s"
+                % ghost.line())
+            assert db.sql("SELECT COUNT(*) FROM defs "
+                          "WHERE def_type='DeadModDef'")[0][0] == 0
+        finally:
+            db.close()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def t_live_the_db_holds_exactly_what_the_manifest_DECLARES():
+    """The strongest single check available: two numbers derived by wholly
+    different routes must land on the same integer."""
+    from measure.dumpdb import read_manifest
+    db = _live()
+    try:
+        path = os.path.join(default_dump_dir(), "manifest.json")
+        _, order = read_manifest(path)
+        declared_sum = sum(v[-1] for v in order.values())
+        actual = db.sql("SELECT COUNT(*) FROM defs")[0][0]
+        assert actual == declared_sum, (
+            "the db holds %d defs, the manifest declares %d — orphan files or "
+            "a parse gap" % (actual, declared_sum))
+    finally:
+        db.close()
+
+
+if __name__ == "__main__":
+    for k, v in sorted(globals().items()):
+        if k.startswith("t_"):
+            case(k[2:], v)
+    print("\n%d/%d passed, %d skipped"
+          % (len(PASS), len(PASS) + len(FAIL), len(SKIP)))
+    sys.exit(1 if FAIL else 0)

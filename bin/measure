@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# `measure` — thin shim so the skill's own docs can say `measure count X`.
+#
+# Put this directory on PATH, or call the CLI directly:
+#   python3 <skill>/scripts/measure/cli.py count ThingDef
+exec python3 "$(cd "$(dirname "${BASH_SOURCE[0]}")/../scripts" && pwd)/measure/cli.py" "$@"
