@@ -356,6 +356,11 @@ def main(argv=None) -> int:
     p.add_argument("--value", default="true")
     p.set_defaults(fn=cmd_flag)
 
+    p = _rows(sub.add_parser("record", help="the full record for one name"))
+    p.add_argument("def_name")
+    p.add_argument("--type", help="disambiguate a name shared across types")
+    p.set_defaults(fn=cmd_record)
+
     p = _rows(sub.add_parser("verify", help="check sqlite against the json, type by type"))
     p.add_argument("--only", nargs="*")
     p.set_defaults(fn=cmd_verify)

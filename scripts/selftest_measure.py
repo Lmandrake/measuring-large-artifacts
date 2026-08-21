@@ -855,6 +855,47 @@ def t_a_rebuild_never_shows_a_reader_a_partial_db():
     assert ".building" in src, "build no longer writes to a temp path"
 
 
+def t_every_documented_command_actually_exists():
+    """A subcommand was documented, implemented, and never registered — and the
+    suite stayed green, because nothing checked the CLI's surface against the
+    docs. That is the same shape as everything else here: an artifact (the docs)
+    asserting something nobody measured.
+    """
+    import re
+    import subprocess
+    api = os.path.join(os.path.dirname(HERE), "references", "api.md")
+    if not os.path.exists(api):
+        raise _Skip("no references/api.md beside this skill")
+    documented = set(re.findall(r"^\| `measure ([a-z]+)", open(api, encoding="utf-8").read(),
+                                re.M))
+    assert documented, "could not parse any commands out of api.md"
+    cli = os.path.join(HERE, "measure", "cli.py")
+    helptext = subprocess.run([sys.executable, cli, "--help"],
+                              capture_output=True, text=True).stdout
+    registered = set(re.findall(r"[{,]([a-z]+)", helptext.split("...")[0]))
+    missing = sorted(documented - registered)
+    assert not missing, "documented but not registered: %s" % missing
+
+
+def t_every_registered_command_is_documented():
+    """The other direction: a command nobody can discover is a command nobody
+    uses, and this skill's whole premise is that the correct path must be the
+    easy one."""
+    import re
+    import subprocess
+    api = os.path.join(os.path.dirname(HERE), "references", "api.md")
+    if not os.path.exists(api):
+        raise _Skip("no references/api.md beside this skill")
+    text = open(api, encoding="utf-8").read()
+    cli = os.path.join(HERE, "measure", "cli.py")
+    helptext = subprocess.run([sys.executable, cli, "--help"],
+                              capture_output=True, text=True).stdout
+    registered = set(re.findall(r"[{,]([a-z]+)", helptext.split("...")[0]))
+    undocumented = sorted(c for c in registered
+                          if f"`measure {c}" not in text)
+    assert not undocumented, "registered but undocumented: %s" % undocumented
+
+
 if __name__ == "__main__":
     for k, v in sorted(globals().items()):
         if k.startswith("t_"):
