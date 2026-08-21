@@ -137,7 +137,7 @@ COVERAGE_ABSENT = "absent"
 COVERAGE_FAILED = "failed"
 COVERAGE_SHADOWED = "shadowed"
 #: 🔴 A file in defs/ that THIS capture's manifest never declared — a leftover
-#: from an earlier dump, not part of this load. `defs/` ACCUMULATES: RimDefDump
+#: from an earlier dump, not part of this load. `defs/` ACCUMULATES: the producer
 #: writes a file per type that exists now and never deletes the file for a type
 #: that has stopped existing. Measured 2026-08-21: all 19 such files were
 #: 126–243 HOURS older than the manifest, while every declared file was written
@@ -350,9 +350,10 @@ def build(dump_dir: str, db_path: str = None, only=None, progress=None) -> Build
     #: given. Kept only to reproduce the old reading; never trusted for a
     #: collided name.
     declared = {k: v[-1] for k, v in declared_order.items()}
-    # The post-d7cf154 dumper writes defTypes[], mapping full name -> file. The
-    # dump on disk today predates it, so this is absent and everything below
-    # still has to work without it.
+    # A fixed producer writes defTypes[], mapping full name -> file, which says
+    # WHICH type won each collided name. Older captures lack it, so everything
+    # below still has to work without it — knowing only THAT a collision
+    # happened, not who won.
     def_types = {d.get("name") or d.get("fullName"): d
                  for d in (manifest.get("defTypes") or [])}
     prov["has_def_types_map"] = "1" if def_types else "0"
@@ -493,8 +494,8 @@ def build(dump_dir: str, db_path: str = None, only=None, progress=None) -> Build
             progress(stem, n)
 
     # --- the 824-def case ------------------------------------------------
-    # A type the manifest DECLARED but no file carries. Under the pre-d7cf154
-    # dumper this is a filename collision: two types shared a simple name and
+    # A type the manifest DECLARED but no file carries. With a producer that
+    # keys on the simple name this is a collision: two types shared a name and
     # the loser was overwritten. It must read `absent`, never 0.
     already = {r[0] for r in con.execute("SELECT def_type FROM capture")}
     for t, counts in declared_order.items():
@@ -509,7 +510,7 @@ def build(dump_dir: str, db_path: str = None, only=None, progress=None) -> Build
             cov, reason = COVERAGE_SHADOWED, (
                 f"declared {count} defs but no file carries defType={t}; "
                 f"defs/{t}.json holds {shadow} instead — a filename collision "
-                f"in the dumper. Fixed in d7cf154; that DLL is undeployed."
+                f"in the producer."
             )
             stats.shadowed += 1
         else:
@@ -593,8 +594,7 @@ def _coverage(inner_type, stem, declared_order, file_count, loaded):
             f"by different def types, counts {written} in write order; each "
             f"write overwrote defs/{stem}.json and the manifest entry, losing "
             f"{lost} defs. The {loaded} defs here belong to the LAST writer "
-            f"only, and the dump no longer records which type that was. "
-            f"Fixed in d7cf154; that DLL is undeployed."
+            f"only, and the dump no longer records which type that was."
         )
     dc = written[0]
     if inner_type != stem:
@@ -752,8 +752,8 @@ class DumpDB:
                 reason=f"coverage={coverage}: {reason}",
                 artifact=def_type,
                 instrument="dumpdb.count",
-                remedy="re-capture with a RimDefDump that includes d7cf154, "
-                       "then rebuild the db",
+                remedy="re-capture with a producer that keys on the "
+                       "fully-qualified type name, then `measure build`",
             )
         m = Measured(
             value=loaded,

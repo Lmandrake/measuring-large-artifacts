@@ -285,7 +285,8 @@ def t_classify_recognises_every_artifact_we_have_burned_on():
         got = artifacts.classify(path)
         assert got is not None, "unclassified: %s" % path
         assert got.kind == kind, "%s -> %s, wanted %s" % (path, got.kind, kind)
-    assert artifacts.classify("src/RimMandrake/measure/cli.py") is None
+    assert artifacts.classify("scripts/measure/cli.py") is None
+    assert artifacts.classify("README.md") is None
 
 
 def t_the_two_formats_we_do_not_own_are_marked_as_such():
