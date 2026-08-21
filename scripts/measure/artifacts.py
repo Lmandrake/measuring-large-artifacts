@@ -187,6 +187,22 @@ def classify(path: str):
     return None
 
 
+def _artifact_suffixes():
+    """Extensions any registered pattern ends in, e.g. {'.rws', '.dll', '.log'}."""
+    out = set()
+    for art in REGISTRY:
+        for pat in art.patterns:
+            base = pat.rsplit("/", 1)[-1]
+            if base.startswith("*.") and "*" not in base[2:]:
+                out.add(base[1:].lower())
+            elif "." in base and "*" not in base:
+                out.add("." + base.rsplit(".", 1)[-1].lower())
+    return out
+
+
+SUFFIXES = _artifact_suffixes()
+
+
 def looks_like_path(tok: str) -> bool:
     """Is this token plausibly a FILE, rather than a search pattern?
 
@@ -197,7 +213,15 @@ def looks_like_path(tok: str) -> bool:
         return False
     if any(c in tok for c in "*?[") and not os.path.exists(tok):
         return False          # an unexpanded glob is a pattern, not a target
-    return ("/" in tok or "\\" in tok or os.path.exists(tok))
+    if "/" in tok or "\\" in tok or os.path.exists(tok):
+        return True
+    # ⚠️ A BARE filename with no directory — `strings Assembly-CSharp.dll` —
+    # walked straight through an earlier cut, because "looks like a path" was
+    # defined as "has a separator". If the token ends in an extension the
+    # registry knows about, it is a target. Found while fixing the skills that
+    # teach these commands, 2026-08-21.
+    low = tok.lower()
+    return any(low.endswith(sfx) for sfx in SUFFIXES)
 
 
 def is_big(path: str, threshold: int = 2_000_000) -> bool:
