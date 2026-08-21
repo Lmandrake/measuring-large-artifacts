@@ -37,9 +37,10 @@ from dataclasses import dataclass
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from measure.result import Measured, Unmeasured, Refused, Report  # noqa: E402
+from measure.result import (Measured, Unmeasured, Refused, Report,
+                            UnmeasuredError)  # noqa: E402
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DB_NAME = "defs.sqlite"
 
 SCHEMA = """
@@ -75,7 +76,15 @@ CREATE TABLE capture (
 CREATE TABLE defs (
     id         INTEGER PRIMARY KEY,
     def_name   TEXT NOT NULL,
+    -- 🔴 The type the dump ENUMERATED, i.e. what this slice is about. NOT the
+    -- record's own reported class. A GeneDef whose concrete class is a subclass
+    -- is still one of the 3845 GeneDefs, and storing the subclass here made
+    -- `count GeneDef` (3845, from the slice) disagree with a COUNT(*) over this
+    -- column (3825). One tool, two answers — found by stress test 2026-08-21.
     def_type   TEXT NOT NULL,
+    -- The record's own reported class, when it differs. Real information, but a
+    -- different question, so it gets its own column.
+    concrete_type TEXT,
     full_name  TEXT,
     label      TEXT,
     mod_name   TEXT,
@@ -104,6 +113,7 @@ CREATE TABLE def_tags (
 
 CREATE INDEX idx_defs_name  ON defs(def_name);
 CREATE INDEX idx_defs_type  ON defs(def_type);
+CREATE INDEX idx_defs_conc  ON defs(concrete_type);
 CREATE INDEX idx_defs_pkg   ON defs(package_id);
 CREATE INDEX idx_flags      ON def_flags(key, value);
 CREATE INDEX idx_flags_def  ON def_flags(def_id);
@@ -214,7 +224,11 @@ def iter_defs(path):
 
     Returns (header, generator). header holds defType and count.
     """
-    with open(path, "r", encoding="utf-8") as fh:
+    # utf-8-sig, not utf-8: a BOM makes the header parse fail, and the old
+    # fallback then trusted the FILENAME over the file's own defType — which
+    # this module states outright is not authoritative. A BOM'd file invented a
+    # def type that never existed. Found by red team 2026-08-21.
+    with open(path, "r", encoding="utf-8-sig") as fh:
         text = fh.read()
 
     dec = json.JSONDecoder()
@@ -235,8 +249,13 @@ def iter_defs(path):
         head_text = head_text[:-1]
     try:
         header = json.loads(head_text + "}")
-    except json.JSONDecodeError:
-        header = {}
+    except json.JSONDecodeError as ex:
+        # ⛔ Do NOT fall back to the filename. The inner defType is the
+        # authority; if it cannot be read, the file is damaged and must say so.
+        raise ValueError(
+            f"{os.path.basename(path)}: header is unreadable ({ex}), so the "
+            f"authoritative defType is unknown. The filename is NOT a "
+            f"substitute for it.")
 
     # The trailing "count" is after the array closes.
     tail = text[-200:]
@@ -372,6 +391,23 @@ def build(dump_dir: str, db_path: str = None, only=None, progress=None) -> Build
         inner_type = header.get("defType") or stem
         full_name = header.get("defTypeFull") or None
         file_count = header.get("fileCount")
+        if inner_type in seen_types:
+            # Two FILES claiming the same inner defType. `capture` is keyed on
+            # def_type so the second row replaces the first, while `defs` rows
+            # accumulate — count said 3 where the table held 6. That is the
+            # keying mistake this package is written about, committed one layer
+            # up, in the reader. Refuse rather than merge: we cannot know which
+            # file owns which records. Found by red team 2026-08-21.
+            con.execute("DELETE FROM defs WHERE def_type = ?", (inner_type,))
+            con.execute(
+                "INSERT OR REPLACE INTO capture VALUES (?,?,?,?,?,?,?,?)",
+                (inner_type, full_name, f"{seen_types[inner_type]}, {fname}",
+                 declared.get(inner_type), None, 0, COVERAGE_SHADOWED,
+                 f"two files claim defType={inner_type} "
+                 f"({seen_types[inner_type]} and {fname}); the dump does not "
+                 f"record which records belong to which, so neither is counted"))
+            stats.shadowed += 1
+            continue
         seen_types[inner_type] = fname
 
         # 🔴 Decide BEFORE ingesting. An orphan's defs must never reach the
@@ -389,36 +425,54 @@ def build(dump_dir: str, db_path: str = None, only=None, progress=None) -> Build
 
         rows, flagrows, tagrows = [], [], []
         n = 0
-        for d in it:
-            did = next_id
-            next_id += 1
-            n += 1
-            fields = d.get("fields") or {}
-            rows.append((
-                did,
-                d.get("defName") or "",
-                d.get("defType") or inner_type,
-                d.get("defTypeFull") or full_name,
-                d.get("label"),
-                d.get("modName"),
-                d.get("packageId"),
-                d.get("shortHash"),
-                json.dumps(d, separators=(",", ":"), ensure_ascii=False),
-            ))
-            isblock = d.get("is")
-            if isinstance(isblock, dict):
-                for k, v in isblock.items():
-                    flagrows.append((did, k, _flagval(v)))
-            for field_name, kind in TAG_FIELDS.items():
-                vals = fields.get(field_name)
-                if isinstance(vals, list):
-                    for v in vals:
-                        tag = _tagval(v)
-                        if tag:
-                            tagrows.append((did, kind, tag))
-            if len(rows) >= 5000:
-                _flush(con, rows, flagrows, tagrows)
-                rows, flagrows, tagrows = [], [], []
+        try:
+            for d in it:
+                did = next_id
+                next_id += 1
+                n += 1
+                fields = d.get("fields") or {}
+                concrete = d.get("defType")
+                rows.append((
+                    did,
+                    d.get("defName") or "",
+                    inner_type,
+                    concrete if concrete and concrete != inner_type else None,
+                    d.get("defTypeFull") or full_name,
+                    d.get("label"),
+                    d.get("modName"),
+                    d.get("packageId"),
+                    d.get("shortHash"),
+                    json.dumps(d, separators=(",", ":"), ensure_ascii=False),
+                ))
+                isblock = d.get("is")
+                if isinstance(isblock, dict):
+                    for k, v in isblock.items():
+                        flagrows.append((did, k, _flagval(v)))
+                for field_name, kind in TAG_FIELDS.items():
+                    vals = fields.get(field_name)
+                    if isinstance(vals, list):
+                        for v in vals:
+                            tag = _tagval(v)
+                            if tag:
+                                tagrows.append((did, kind, tag))
+                if len(rows) >= 5000:
+                    _flush(con, rows, flagrows, tagrows)
+                    rows, flagrows, tagrows = [], [], []
+        except Exception as ex:
+            # 🔴 Truncation raises HERE, during iteration, not at open() — so
+            # wrapping only the open left COVERAGE_FAILED unreachable for the
+            # commonest damage, and one bad file aborted the entire build.
+            _flush(con, rows, flagrows, tagrows)
+            con.execute(
+                "INSERT OR REPLACE INTO capture VALUES (?,?,?,?,?,?,?,?)",
+                (inner_type, full_name, fname, declared.get(inner_type),
+                 file_count, n, COVERAGE_FAILED,
+                 f"read failed after {n} defs: {ex}"))
+            con.execute("DELETE FROM defs WHERE def_type = ?", (inner_type,))
+            stats.failed += 1
+            stats.types_seen += 1
+            seen_types[inner_type] = fname
+            continue
         _flush(con, rows, flagrows, tagrows)
 
         stats.types_seen += 1
@@ -442,8 +496,12 @@ def build(dump_dir: str, db_path: str = None, only=None, progress=None) -> Build
     # A type the manifest DECLARED but no file carries. Under the pre-d7cf154
     # dumper this is a filename collision: two types shared a simple name and
     # the loser was overwritten. It must read `absent`, never 0.
+    already = {r[0] for r in con.execute("SELECT def_type FROM capture")}
     for t, counts in declared_order.items():
-        if t in seen_types:
+        if t in seen_types or t in already:
+            # A row already exists — typically `failed` from a damaged file.
+            # Overwriting it with `absent` made stats.failed disagree with the
+            # table, so the two told different stories about the same type.
             continue
         count = counts[-1]
         shadow = _shadowed_by(t, seen_types, def_types)
@@ -465,6 +523,8 @@ def build(dump_dir: str, db_path: str = None, only=None, progress=None) -> Build
             (t, None, None, count, None, 0, cov, reason),
         )
 
+    # Written LAST on purpose: its presence is what marks the build complete,
+    # and DumpDB refuses a db without it.
     prov["types_declared"] = str(len(declared))
     prov["types_captured"] = str(stats.types_seen)
     prov["defs_total"] = str(stats.defs_inserted)
@@ -492,7 +552,7 @@ def _tagval(v):
 
 def _flush(con, rows, flagrows, tagrows):
     if rows:
-        con.executemany("INSERT INTO defs VALUES (?,?,?,?,?,?,?,?,?)", rows)
+        con.executemany("INSERT INTO defs VALUES (?,?,?,?,?,?,?,?,?,?)", rows)
     if flagrows:
         con.executemany("INSERT INTO def_flags VALUES (?,?,?)", flagrows)
     if tagrows:
@@ -576,6 +636,15 @@ class DumpDB:
             raise FileNotFoundError(db_path)
         self.con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         self.prov = dict(self.con.execute("SELECT key, value FROM provenance"))
+        if not self.prov.get("schema_version"):
+            # `build` writes provenance LAST, so a db with none is the debris of
+            # a crashed build. Left unchecked it reported "MEASURED 0 def types
+            # complete", exit 0 — a capture that measured nothing claiming to be
+            # whole. Found by red team 2026-08-21.
+            raise ValueError(
+                f"{db_path} has no provenance — it is the debris of an "
+                f"interrupted build, not an empty capture. Re-run `measure "
+                f"build`.")
         self.stale = self._staleness() if check_currency else None
 
     def _staleness(self):
@@ -602,7 +671,13 @@ class DumpDB:
         except Exception as ex:
             return f"the source manifest is unreadable ({ex})"
         cap = manifest.get("capturedUtc", "")
-        if cap and cap != self.prov.get("captured_utc"):
+        if not cap:
+            # Absent stamp is NOT a pass. Without it only the mod-set
+            # fingerprint remains, and a re-capture on the same inputs has the
+            # same fingerprint — so a changed dump would read current.
+            return ("the source manifest carries no capturedUtc, so this db's "
+                    "currency cannot be established")
+        if cap != self.prov.get("captured_utc"):
             return (f"the dump on disk was re-captured at {cap}; this db is "
                     f"built from {self.prov.get('captured_utc')}")
         fp = modlist_fingerprint(manifest.get("mods", []))
@@ -618,7 +693,7 @@ class DumpDB:
                 reason=f"this defs.sqlite is stale — {self.stale}",
                 artifact=artifact,
                 instrument="dumpdb",
-                remedy="python3 src/RimMandrake/measure/cli.py build",
+                remedy="measure build",
             )
         return None
 
@@ -651,7 +726,7 @@ class DumpDB:
                        f"({self.prov.get('types_declared','?')} declared)",
                 artifact=def_type,
                 instrument="dumpdb.count",
-                remedy="check the spelling with `types --like`; the dump only "
+                remedy="check the spelling with `measure types <substring>`; the dump only "
                        "holds types the running game had loaded",
             )
         coverage, reason, declared, loaded = row
@@ -799,9 +874,17 @@ class DumpDB:
         )
 
     def sql(self, query: str, args=()):
-        """Escape hatch. Returns rows, not a Measurement — the caller owns the
-        interpretation, which is exactly the risk this module otherwise removes.
+        """Escape hatch. Returns raw rows — the caller owns the interpretation.
+
+        🔴 It still honours the staleness guard, and it raises rather than
+        answering from a stale artifact. The CLI must NEVER wrap what comes back
+        here in a `Measured`: a raw row carries no coverage, so
+        `SELECT loaded_count … WHERE def_type='AbilityDef'` returns 0 — the
+        package's own canonical wrong number — while `count` on the same db in
+        the same second refuses. Found by red team 2026-08-21.
         """
+        if self.stale:
+            raise UnmeasuredError(f"defs.sqlite is stale — {self.stale}")
         return list(self.con.execute(query, args))
 
     # ---- the trust migration -------------------------------------------
@@ -826,6 +909,14 @@ class DumpDB:
                 continue
             inner = header.get("defType") or stem
             n = sum(1 for _ in it)
+            cov = self.con.execute(
+                "SELECT coverage FROM capture WHERE def_type = ?", (inner,)
+            ).fetchone()
+            if cov and cov[0] == COVERAGE_ORPHAN:
+                # Excluded deliberately, not lost. Reporting it as a
+                # json-vs-sqlite disagreement would send the reader to
+                # "rebuild the db", which cannot and must not change it.
+                continue
             db_n = self.con.execute(
                 "SELECT COUNT(*) FROM defs WHERE def_type = ?", (inner,)
             ).fetchone()[0]

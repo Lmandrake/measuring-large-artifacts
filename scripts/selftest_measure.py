@@ -48,6 +48,13 @@ def case(name, fn):
     except AssertionError as e:
         FAIL.append(name)
         print("FAIL  %s\n        %s" % (name, e))
+    except Exception as e:
+        # An infrastructure failure (a locked db, a missing mount) used to
+        # escape and kill the run mid-alphabet, so no "N/M passed" line printed
+        # and the remaining cases silently never ran. A crashed suite must be
+        # loud, and must be distinguishable from a finished one.
+        FAIL.append(name)
+        print("ERROR %s\n        %s: %s" % (name, type(e).__name__, e))
 
 
 class _Skip(Exception):
@@ -571,6 +578,230 @@ def t_live_the_db_holds_exactly_what_the_manifest_DECLARES():
             "a parse gap" % (actual, declared_sum))
     finally:
         db.close()
+
+
+def t_count_and_the_rows_table_can_never_disagree():
+    """🔴 One tool must not give two answers to one question.
+
+    `count X` reads the slice's total; a COUNT(*) over the rows reads the table.
+    When the rows were keyed on each record's own reported CLASS instead of the
+    type the dump enumerated, those diverged — 3845 vs 3825 for one real type,
+    and 24 vs 0 for another. Both looked authoritative. Found by stress test
+    2026-08-21, and it is exactly the failure this whole package exists to stop,
+    committed by the package itself.
+    """
+    tmp, db = synthetic_db()
+    try:
+        for (t,) in db.sql("SELECT def_type FROM capture "
+                           "WHERE coverage IN ('complete','ambiguous')"):
+            c = db.count(t)
+            if not c.ok:
+                continue
+            rows = db.sql("SELECT COUNT(*) FROM defs WHERE def_type=?", (t,))[0][0]
+            assert c.unwrap() == rows, (
+                "count(%s)=%s but the rows table holds %s" % (t, c.unwrap(), rows))
+    finally:
+        db.close()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def t_live_count_and_rows_agree_for_every_countable_type():
+    db = _live()
+    try:
+        bad = []
+        for (t,) in db.sql("SELECT def_type FROM capture "
+                           "WHERE coverage IN ('complete','ambiguous')"):
+            c = db.count(t)
+            if not c.ok:
+                continue
+            rows = db.sql("SELECT COUNT(*) FROM defs WHERE def_type=?", (t,))[0][0]
+            if c.unwrap() != rows:
+                bad.append((t, c.unwrap(), rows))
+        assert not bad, "%d types disagree with their own rows: %s" % (
+            len(bad), bad[:5])
+    finally:
+        db.close()
+
+
+def t_live_verify_reconciles_with_coverage():
+    """verify and coverage must not accuse the artifact of different damage.
+
+    A reader who is told 42 types disagree but 32 are damaged cannot act on
+    either number, and correctly does nothing — which makes both useless.
+    """
+    db = _live()
+    try:
+        rep = db.verify_against_json(default_dump_dir())
+        bad = [r.artifact for r in rep.unmeasured]
+        assert not bad, (
+            "verify reports %d disagreements that coverage does not explain: %s"
+            % (len(bad), bad[:5]))
+    finally:
+        db.close()
+
+
+def t_a_usage_error_never_wears_the_unmeasured_exit_code():
+    """Exit 2 means 'the artifact does not carry the evidence'. A typo is not
+    that, and a caller branching on status must not read its own bug as a
+    finding."""
+    import subprocess
+    cli = os.path.join(HERE, "measure", "cli.py")
+    for argv in (["count"], ["notacommand"], ["--rows", "x", "coverage"]):
+        r = subprocess.run([sys.executable, cli] + argv,
+                           capture_output=True, text=True)
+        assert r.returncode not in (0, 2, 3), (
+            "%s exited %d, colliding with a measurement code" % (argv, r.returncode))
+
+
+def t_detail_flags_never_change_the_verdict():
+    """`--rows` asks for more output; it must not turn UNMEASURED into success."""
+    import subprocess
+    cli = os.path.join(HERE, "measure", "cli.py")
+    if not os.path.exists(os.path.join(default_dump_dir(), DB_NAME)):
+        raise _Skip("no live db")
+    bare = subprocess.run([sys.executable, cli, "coverage"],
+                          capture_output=True, text=True).returncode
+    detail = subprocess.run([sys.executable, cli, "coverage", "--rows", "3"],
+                            capture_output=True, text=True).returncode
+    assert bare == detail, (
+        "coverage exits %d but coverage --rows exits %d" % (bare, detail))
+
+
+# --------------------------------------------------------------------------
+# red team, 2026-08-21 — five criticals. Each is pinned here.
+# --------------------------------------------------------------------------
+
+def t_the_escape_hatch_never_mints_a_measurement():
+    """🔴 `sql` returned `MEASURED 0` for the canonical wrong number, exit 0,
+    with the artifact's provenance stamped on it — while `count` on the same db
+    in the same second refused. A raw row carries no coverage."""
+    import subprocess
+    cli = os.path.join(HERE, "measure", "cli.py")
+    if not os.path.exists(os.path.join(default_dump_dir(), DB_NAME)):
+        raise _Skip("no live db")
+    r = subprocess.run(
+        [sys.executable, cli, "sql",
+         "SELECT loaded_count FROM capture WHERE def_type='AbilityDef'"],
+        capture_output=True, text=True)
+    assert "MEASURED" not in r.stdout, r.stdout
+    assert "RAW" in r.stdout, r.stdout
+    assert r.returncode == 3, r.returncode
+
+
+def t_a_crashed_build_leaves_nothing_that_answers():
+    """🔴 build writes provenance LAST. A db without it is debris, and it used
+    to report `MEASURED 0 def types complete` — a capture that measured nothing
+    claiming to be whole."""
+    tmp = tempfile.mkdtemp(prefix="measure_wreck_")
+    try:
+        make_dump(tmp)
+        build(tmp)
+        db_path = os.path.join(tmp, DB_NAME)
+        import sqlite3
+        con = sqlite3.connect(db_path)
+        con.execute("DELETE FROM provenance")     # simulate the crash
+        con.commit(); con.close()
+        try:
+            DumpDB(db_path)
+        except ValueError as ex:
+            assert "interrupted build" in str(ex), str(ex)
+            return
+        raise AssertionError("a db with no provenance opened and answered")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def t_a_truncated_file_is_recorded_not_fatal():
+    """🔴 The generator is consumed outside the open(), so truncation raised
+    mid-iteration: COVERAGE_FAILED was unreachable and one bad file aborted the
+    whole build."""
+    tmp = tempfile.mkdtemp(prefix="measure_trunc_")
+    try:
+        make_dump(tmp)
+        p = os.path.join(tmp, "defs", "BiomeDef.json")
+        text = open(p, encoding="utf-8").read()
+        open(p, "w", encoding="utf-8").write(text[: len(text) // 2])
+        stats = build(tmp)            # must NOT raise
+        db = DumpDB(os.path.join(tmp, DB_NAME))
+        try:
+            cov = dict(db.sql("SELECT def_type, coverage FROM capture"))
+            assert cov["BiomeDef"] == "failed", cov["BiomeDef"]
+            assert not db.count("BiomeDef").ok
+            assert db.count("ThingDef").unwrap() == 3, "one bad file broke the rest"
+            assert stats.failed == 1, stats
+        finally:
+            db.close()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def t_two_files_claiming_one_type_are_refused_not_merged():
+    """🔴 `capture` is keyed on def_type but `defs` rows accumulate, so count
+    said 3 where the table held 6 — the keying mistake this package is written
+    about, committed in the reader."""
+    tmp = tempfile.mkdtemp(prefix="measure_dup2_")
+    try:
+        make_dump(tmp)
+        d = os.path.join(tmp, "defs")
+        for name in ("DupA", "DupB"):
+            with open(os.path.join(d, name + ".json"), "w", encoding="utf-8") as fh:
+                json.dump({"defType": "DupDefX", "count": 3, "defs": [
+                    {"defName": f"{name}{i}", "defType": "DupDefX", "fields": {}}
+                    for i in range(3)]}, fh)
+        text = open(os.path.join(tmp, "manifest.json"), encoding="utf-8").read()
+        open(os.path.join(tmp, "manifest.json"), "w", encoding="utf-8").write(
+            text.replace('"ThingDef":3', '"ThingDef":3,"DupDefX":3'))
+        build(tmp)
+        db = DumpDB(os.path.join(tmp, DB_NAME))
+        try:
+            got = db.count("DupDefX")
+            assert not got.ok, "two files sharing a type returned a number: %s" % got.line()
+            rows = db.sql("SELECT COUNT(*) FROM defs WHERE def_type='DupDefX'")[0][0]
+            assert rows == 0, "records from an ambiguous pair were ingested: %d" % rows
+        finally:
+            db.close()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def t_a_bom_does_not_make_the_filename_authoritative():
+    """🔴 A BOM broke the header parse, and the old fallback trusted the
+    FILENAME — inventing a def type that never existed and marking the real one
+    absent. This module states the inner defType is the authority."""
+    tmp = tempfile.mkdtemp(prefix="measure_bom_")
+    try:
+        make_dump(tmp)
+        p = os.path.join(tmp, "defs", "Alpha.json")
+        with open(p, "w", encoding="utf-8-sig") as fh:
+            json.dump({"defType": "BetaDef", "count": 1, "defs": [
+                {"defName": "B1", "defType": "BetaDef", "fields": {}}]}, fh)
+        build(tmp)
+        db = DumpDB(os.path.join(tmp, DB_NAME))
+        try:
+            types = {r[0] for r in db.sql("SELECT def_type FROM capture")}
+            assert "Alpha" not in types, "the filename was invented as a type"
+            assert "BetaDef" in types, types
+        finally:
+            db.close()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def t_a_manifest_with_no_capture_stamp_is_not_silently_current():
+    """🔴 The freshness check was `if cap and ...`, so a missing stamp skipped
+    it entirely and left only a fingerprint that a re-capture reproduces."""
+    tmp, db = synthetic_db()
+    try:
+        db.close()
+        text = open(os.path.join(tmp, "manifest.json"), encoding="utf-8").read()
+        open(os.path.join(tmp, "manifest.json"), "w", encoding="utf-8").write(
+            text.replace('"capturedUtc":"2026-08-21T00:00:00Z",', ""))
+        db = DumpDB(os.path.join(tmp, DB_NAME))
+        assert db.stale, "a manifest with no capturedUtc read as current"
+        assert not db.count("ThingDef").ok
+    finally:
+        db.close()
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":

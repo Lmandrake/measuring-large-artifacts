@@ -69,7 +69,14 @@ message is not a repeated failure.
 ✅ Grepping for a literal error string to see **whether** it occurred is the
 correct use. ⛔ Counting occurrences to judge severity is not.
 
-⇒ `src/RimMandrake/Utils/harvest_log.py`
+⇒ `python3 src/RimMandrake/Utils/harvest_log.py --log <path>` — note `--log`,
+not a positional. It **refuses by default when the def dump predates the log**,
+because a dump from an earlier run cannot explain this one; `--stale-ok`
+overrides that when you have read the refusal and disagree.
+
+⚠️ There is no `measure` command for logs yet. Until there is, "how many errors"
+has no trustworthy answer here — `harvest_log.py` groups traces, but the honest
+move is to answer the narrower question ("did X occur") rather than a count.
 
 ## World CSVs — `world/*.csv`
 

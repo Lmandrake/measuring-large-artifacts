@@ -27,10 +27,14 @@
 | `measure explain <path>` | what IS this file, and what may read it |
 | `measure sql "SELECT …"` | read-only escape hatch |
 
-Global flags: `--dump <dir>`, `--db <path>`, `--rows N`.
+Flags: `--dump <dir>`, `--db <path>`, `--rows N`. `--rows` is accepted **either
+before or after the subcommand** — `measure coverage --rows 20` and
+`measure --rows 20 coverage` are the same command.
 
 `--rows N` is the opt-in to detail. Without it every command prints **one line**,
 because a question that costs a screenful is a question nobody asks twice.
+⚠️ Detail never changes the verdict: `coverage --rows 20` exits with the same
+code as `coverage`.
 
 ## Exit status
 
@@ -39,6 +43,11 @@ because a question that costs a screenful is a question nobody asks twice.
 | 0 | `MEASURED` |
 | 2 | `UNMEASURED` — the artifact does not carry the evidence |
 | 3 | `REFUSED` — this instrument cannot judge the question |
+| 64 | usage error — your command was malformed. **Not a measurement.** |
+
+🔑 64 rather than argparse's default 2 is deliberate: 2 already means
+`UNMEASURED`, so a typo would be indistinguishable from a real finding and a
+shell caller would treat its own bug as evidence.
 
 So a shell caller can branch on ignorance without parsing text:
 

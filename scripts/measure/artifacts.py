@@ -51,13 +51,14 @@ REGISTRY = (
         # and refusing it would be an unearned refusal on the one file in the
         # dump a human CAN read. (The manifest's trap is `json.load` silently
         # dropping duplicate defCounts keys, which a grep actually exposes.)
-        patterns=("*/DefDump/defs/*", "*/DefDump/animals.json"),
+        patterns=("*/DefDump/defs/*", "*/DefDump/animals.json",
+                  "*/DefDump/defs", "*/DefDump", "*/DefDump/"),
         encoding=(
             "one JSON object per def type on a SINGLE line, up to 331 MB — "
             "a grep hit is a fragment of a record, never a record, and the "
             "line count is always 1"
         ),
-        instrument="python3 src/RimMandrake/measure/cli.py count <DefType>",
+        instrument="measure count <DefType>",
         literal_scan_ok=False,
         ours=True,
         incident=(
@@ -68,15 +69,15 @@ REGISTRY = (
     ),
     Artifact(
         kind="savegame",
-        patterns=("*.rws",),
+        patterns=("*.rws", "*.rws.bak", "*.rws.*"),
         encoding=(
             "plain XML wrapping base64/raw-DEFLATE map grids of 2-byte def "
             "shortHashes — biomes, terrain and things are INDICES into a "
             "compressed grid, not defNames, so they are not present as text"
         ),
         instrument=(
-            "python3 src/RimMandrake/Utils/rimbench/savemap.py, or the bridge "
-            "for a live game"
+            "rimbench/savemap.py, or the live bridge. `measure explain <path>` "
+            "says why"
         ),
         literal_scan_ok=True,
         ours=False,
@@ -116,7 +117,7 @@ REGISTRY = (
             "CSV with a header row; a grep count includes the header and any "
             "value that merely CONTAINS the token in another column"
         ),
-        instrument="python3 src/RimMandrake/measure/cli.py csv <path> --where col=value",
+        instrument="measure csv <path> --where col=value",
         literal_scan_ok=True,
         ours=True,
         notes=(
@@ -126,12 +127,15 @@ REGISTRY = (
     ),
     Artifact(
         kind="playerlog",
-        patterns=("*/Player.log", "*/Player-prev.log", "*Player.log"),
+        # ⚠️ NOT "*Player.log" — that matched `my_notes_about_Player.log`,
+        # an ordinary text file, and refusing it is an unearned refusal.
+        patterns=("*/Player.log", "Player.log", "*/Player-prev.log",
+                  "Player-prev.log", "*/Player.log.*"),
         encoding=(
             "multi-line stack traces and repeated identical lines; a grep -c "
             "counts LINES, and one error spanning 30 lines is not 30 errors"
         ),
-        instrument="python3 src/RimMandrake/Utils/harvest_log.py",
+        instrument="harvest_log.py (RimWorld), or any reader that groups stack traces rather than counting lines",
         literal_scan_ok=True,
         ours=False,
         notes=(
@@ -144,7 +148,19 @@ REGISTRY = (
 
 #: Scanning tools that return a number with no error when they do not
 #: understand the encoding. This is the list the hook gates on.
-BLIND_SCANNERS = ("grep", "egrep", "fgrep", "rg", "ag", "strings", "wc", "awk", "sed")
+BLIND_SCANNERS = ("grep", "egrep", "fgrep", "zgrep", "bzgrep", "xzgrep",
+                  "rg", "ag", "ack", "strings", "wc", "awk", "sed")
+
+#: Tools that merely READ a file and hand it on. `cat x.rws | grep -c biome`
+#: puts the path on one segment and the scanner on the next, so neither segment
+#: alone looks like an offence — the pipeline as a whole is one.
+READERS = ("cat", "zcat", "bzcat", "xzcat", "head", "tail", "type")
+
+#: Scanners whose FIRST non-flag argument is a PATTERN, not a path. Classifying
+#: it is how `grep -c "world/tiles.csv" notes.txt` got refused — the search
+#: string was mistaken for the target.
+PATTERN_FIRST = ("grep", "egrep", "fgrep", "zgrep", "bzgrep", "xzgrep",
+                 "ag", "ack", "sed", "awk")
 
 
 def classify(path: str):
@@ -155,17 +171,33 @@ def classify(path: str):
     """
     if not path:
         return None
-    p = path.replace("\\", "/")
+    p = path.replace("\\", "/").rstrip("/") or "/"
     # A bare relative path should still match "world/*.csv".
     candidates = [p, p.lstrip("./")]
     if not p.startswith("/"):
         candidates.append("/" + p)
+    # Case-insensitive: `save.RWS` and `Mod.DLL` are the same artifacts, and on
+    # Linux fnmatch is case-sensitive, so uppercase extensions walked straight
+    # through. Found by red team 2026-08-21.
     for art in REGISTRY:
         for pat in art.patterns:
             for cand in candidates:
-                if fnmatch.fnmatch(cand, pat):
+                if fnmatch.fnmatch(cand.lower(), pat.lower()):
                     return art
     return None
+
+
+def looks_like_path(tok: str) -> bool:
+    """Is this token plausibly a FILE, rather than a search pattern?
+
+    A pattern that happens to contain a path-ish string is the commonest source
+    of an unearned refusal, and unearned refusals get the guard switched off.
+    """
+    if not tok or tok.startswith("-"):
+        return False
+    if any(c in tok for c in "*?[") and not os.path.exists(tok):
+        return False          # an unexpanded glob is a pattern, not a target
+    return ("/" in tok or "\\" in tok or os.path.exists(tok))
 
 
 def is_big(path: str, threshold: int = 2_000_000) -> bool:

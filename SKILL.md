@@ -62,6 +62,13 @@ Two consequences that catch people:
 
 ## Using it
 
+`measure` is `bin/measure` in this skill. It is **not on `PATH` by default** —
+either add `bin/` to `PATH`, or call the CLI directly:
+
+```bash
+python3 ~/.claude/skills/measuring-large-artifacts/scripts/measure/cli.py count <Type>
+```
+
 ```bash
 measure count <Type>          # MEASURED 24904  /  UNMEASURED + why
 measure coverage              # what the artifact did NOT capture
@@ -72,8 +79,10 @@ measure build                 # (re)build the queryable form
 ```
 
 Exit status carries the tri-state so scripts can branch: `0` measured, `2`
-unmeasured, `3` refused. One line of output per question by design — a count that
-costs a screen of text is a count nobody will run twice.
+unmeasured, `3` refused — and **`64` for a malformed command**, deliberately
+outside the measurement codes so a typo can never be read as a finding. One line
+of output per question by design; `--rows N` adds detail **without changing the
+verdict or the exit code**.
 
 `measure explain <path>` is the cheapest useful thing here and the best habit:
 before scanning anything big, ask what it is. It answers from the same registry
@@ -133,6 +142,14 @@ confident liar again.
 | what a config or source file SAYS | read the source; a dump shows the result, not the intent |
 | does this exact literal string occur | a plain scan is fine, and often best |
 | how many, of something structured | never a scan |
+
+⚠️ **`measure` does not answer every artifact.** It has commands for the def
+dump and for CSVs; for a savegame, a log or an assembly it classifies the file
+and hands you to the right reader, which is a different tool with its own
+arguments. `measure explain <path>` tells you which. When the named tool has no
+`measure` equivalent, the honest answer to "how many" is often `REFUSED` plus
+the narrower question that *can* be answered — "did X occur" instead of "how
+many X".
 
 **A literal-string search is legitimate and this skill does not forbid it.** The
 distinction that matters is *literal vs semantic*: "does the byte sequence

@@ -1,10 +1,10 @@
 """`measure` — one question, one line.
 
-    python3 src/RimMandrake/measure/cli.py count AbilityDef
-    python3 src/RimMandrake/measure/cli.py coverage
-    python3 src/RimMandrake/measure/cli.py tag Gun --kind weaponTags
-    python3 src/RimMandrake/measure/cli.py get Gun_Revolver
-    python3 src/RimMandrake/measure/cli.py csv world/ASHKARR_WORLDMAP_tiles.csv --where biome=Desert
+    measure count AbilityDef
+    measure coverage
+    measure tag Gun --kind weaponTags
+    measure get Gun_Revolver
+    measure csv world/ASHKARR_WORLDMAP_tiles.csv --where biome=Desert
 
 Design constraint, from the analysis: **the correct path must be cheaper than
 grep or it will be routed around.** So every subcommand prints ONE line by
@@ -14,6 +14,11 @@ Exit status carries the tri-state for scripts:
     0  measured
     2  unmeasured  (the artifact does not hold the evidence)
     3  refused     (this instrument cannot judge the question)
+   64  usage error (your command was malformed — NOT a measurement)
+
+⚠️ 64 rather than argparse's default 2 is deliberate: a typo must never be
+readable as "unmeasured", or a caller branching on exit status treats its own
+bug as a finding.
 """
 
 from __future__ import annotations
@@ -33,6 +38,20 @@ from measure.dumpdb import (  # noqa: E402
 
 EXIT = {"MEASURED": 0, "UNMEASURED": 2, "REFUSED": 3}
 
+#: 🔴 A malformed command must NOT exit 2. argparse's default is 2, which is
+#: this tool's code for UNMEASURED — so a typo would be indistinguishable from
+#: "the artifact does not carry the evidence", and a shell caller branching on
+#: exit status would silently treat its own bug as a real measurement. Found by
+#: a cold reader following references/api.md, 2026-08-21.
+EXIT_USAGE = 64          # sysexits.h EX_USAGE
+
+
+class _Parser(argparse.ArgumentParser):
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        sys.stderr.write(f"{self.prog}: error: {message}\n")
+        raise SystemExit(EXIT_USAGE)
+
 
 def emit(m) -> int:
     print(m.line())
@@ -45,7 +64,7 @@ def _db(args) -> DumpDB:
         print(Unmeasured(
             reason=f"no {DB_NAME} at {path}",
             artifact="dumpdb",
-            remedy="python3 src/RimMandrake/measure/cli.py build",
+            remedy="measure build",
         ).line())
         raise SystemExit(2)
     return DumpDB(path)
@@ -83,7 +102,6 @@ def cmd_types(args) -> int:
                   f"declared={declared if declared is not None else '-'}")
         if len(rows) > args.rows:
             print(f"... {len(rows) - args.rows} more (use --rows)")
-        return 0
     return emit(Measured(
         value=len(rows), instrument="dumpdb.types",
         artifact=f"types matching {args.like}" if args.like else "def types",
@@ -99,7 +117,17 @@ def cmd_coverage(args) -> int:
     total = sum(summary.values())
     bad = total - complete
     detail = " ".join(f"{k}={v}" for k, v in sorted(summary.items()))
-    if args.rows:
+
+    def _detail():
+        """🔑 Print detail, but NEVER instead of the verdict.
+
+        `--rows` asks for more output; it does not change the answer. An earlier
+        cut returned 0 here, so `coverage --rows 20` exited success on the same
+        question that `coverage` reported UNMEASURED — the detail flag silently
+        flipped the finding. Found by a cold reader, 2026-08-21.
+        """
+        if not args.rows:
+            return
         rows = db.sql(
             "SELECT def_type, coverage, declared_count, reason FROM capture "
             "WHERE coverage <> 'complete' ORDER BY declared_count DESC")
@@ -107,7 +135,7 @@ def cmd_coverage(args) -> int:
             print(f"{t:44s} {cov:9s} declared={dc} — {reason}")
         if len(rows) > args.rows:
             print(f"... {len(rows) - args.rows} more")
-        return 0
+
     if bad:
         # ⚠️ Say what each state COSTS, not just that it is not `complete`.
         # Only `ambiguous` still answers correctly; `shadowed`, `absent`,
@@ -116,6 +144,7 @@ def cmd_coverage(args) -> int:
         refusing = sum(v for k, v in summary.items()
                        if k in ("shadowed", "absent", "orphan", "partial",
                                 "failed"))
+        _detail()
         return emit(Unmeasured(
             reason=f"{refusing} of {total} def types cannot be counted at all "
                    f"and {bad - refusing} more answer without a cross-check "
@@ -125,6 +154,7 @@ def cmd_coverage(args) -> int:
             remedy="`coverage --rows 20` names them with the reason; a count "
                    "for a shadowed/absent type is UNMEASURED, never zero",
         ))
+    _detail()
     return emit(Measured(value=total, instrument="dumpdb.coverage",
                          artifact="def types complete", against=db.against))
 
@@ -165,26 +195,48 @@ def cmd_verify(args) -> int:
 
 
 def cmd_sql(args) -> int:
+    """The escape hatch — and deliberately NOT a measurement.
+
+    🔴 An earlier cut wrapped whatever came back in `Measured` and stamped the
+    artifact's provenance on it. `SELECT loaded_count FROM capture WHERE
+    def_type='AbilityDef'` then printed `MEASURED 0` with exit 0 — the exact
+    wrong number this package exists to prevent — while `count AbilityDef` on
+    the same db in the same second refused. A raw row carries no coverage, so it
+    cannot be a measurement. Found by red team 2026-08-21.
+
+    Output is labelled RAW and exits 3 (REFUSED): the rows are real, but this
+    command cannot vouch for what they mean. That is the caller's job, which is
+    the whole point of an escape hatch.
+    """
     db = _db(args)
     q = args.query.strip()
-    if not q.lower().startswith("select"):
+    low = q.lower()
+    if not (low.startswith("select") or low.startswith("with")):
         return emit(Refused(
-            reason="only SELECT is allowed; the db is opened read-only",
+            reason="only SELECT (or a WITH ... SELECT) is allowed; the db is "
+                   "opened read-only",
             artifact="sql", instrument="dumpdb.sql",
-            right_instrument="rebuild with `build` if the data is wrong"))
-    rows = db.sql(q)
-    if args.rows:
-        for r in rows[: args.rows]:
-            print("\t".join("" if c is None else str(c) for c in r))
-        if len(rows) > args.rows:
-            print(f"... {len(rows) - args.rows} more")
-        return 0
-    if len(rows) == 1 and len(rows[0]) == 1:
-        return emit(Measured(value=rows[0][0], instrument="dumpdb.sql",
-                             artifact=q[:60], against=db.against))
-    return emit(Measured(value=len(rows), instrument="dumpdb.sql",
-                         artifact=f"rows from {q[:50]}", against=db.against,
-                         evidence="add --rows N to see them"))
+            right_instrument="rebuild with `measure build` if the data is wrong"))
+    if ";" in q.rstrip().rstrip(";"):
+        return emit(Refused(
+            reason="one statement at a time",
+            artifact="sql", instrument="dumpdb.sql",
+            right_instrument="run the statements separately"))
+    try:
+        rows = db.sql(q)
+    except Exception as ex:
+        return emit(Unmeasured(
+            reason=str(ex), artifact="sql", instrument="dumpdb.sql",
+            remedy="fix the query, or `measure build` if the db is stale"))
+    limit = args.rows or 20
+    for r in rows[:limit]:
+        print("\t".join("" if c is None else str(c) for c in r))
+    if len(rows) > limit:
+        print(f"... {len(rows) - limit} more (use --rows)")
+    print(f"RAW {len(rows)} row(s) from a read-only query @ {db.against} — "
+          f"NOT a measurement: raw rows carry no coverage, so a 0 here may mean "
+          f"'not captured'. Use `count`/`coverage` for an answer you can quote.")
+    return 3
 
 
 def cmd_csv(args) -> int:
@@ -224,10 +276,16 @@ def cmd_explain(args) -> int:
     art = artifacts.classify(args.path)
     if art is None:
         big = artifacts.is_big(args.path)
-        return emit(Measured(
-            value="unregistered", instrument="artifacts.classify",
-            artifact=args.path,
-            evidence="large — consider registering it" if big else "read it whole"))
+        # "I do not know what this is" is precisely the state the tri-state
+        # exists to keep out of MEASURED.
+        return emit(Refused(
+            reason="not a registered artifact class, so this skill has nothing "
+                   "to say about how to read it"
+                   + (" — and it is large enough to be worth registering"
+                      if big else "; small enough to just read"),
+            artifact=args.path, instrument="artifacts.classify",
+            right_instrument="read it directly, or add it to "
+                             "scripts/measure/artifacts.py"))
     print(f"{args.path} is a {art.kind}")
     print(f"  encoding : {art.encoding}")
     print(f"  use      : {art.instrument}")
@@ -240,62 +298,75 @@ def cmd_explain(args) -> int:
 # --------------------------------------------------------------------------
 
 def main(argv=None) -> int:
-    ap = argparse.ArgumentParser(
+    ap = _Parser(
         prog="measure",
         description="One question about a large artifact, one line back.")
     ap.add_argument("--dump", help="DefDump directory (default: the live one)")
     ap.add_argument("--db", help=f"path to {DB_NAME}")
     ap.add_argument("--rows", type=int, default=0,
                     help="print up to N records instead of one summary line")
+
+    def _rows(p):
+        """Accept --rows after the subcommand too.
+
+        The docs and the tool's own remedy text both say `coverage --rows 20`,
+        and a reader who types what they were told must not get a usage error.
+        A different dest keeps the subparser default from clobbering the global.
+        """
+        p.add_argument("--rows", type=int, default=None, dest="rows_sub",
+                       help=argparse.SUPPRESS)
+        return p
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    p = sub.add_parser("build", help="build defs.sqlite from a DefDump")
+    p = _rows(sub.add_parser("build", help="build defs.sqlite from a DefDump"))
     p.add_argument("--only", nargs="*", help="only these def types")
     p.set_defaults(fn=cmd_build)
 
-    p = sub.add_parser("count", help="how many defs of a type")
+    p = _rows(sub.add_parser("count", help="how many defs of a type"))
     p.add_argument("def_type")
     p.set_defaults(fn=cmd_count)
 
-    p = sub.add_parser("types", help="which def types exist")
+    p = _rows(sub.add_parser("types", help="which def types exist"))
     p.add_argument("like", nargs="?")
     p.set_defaults(fn=cmd_types)
 
-    p = sub.add_parser("coverage", help="which types are NOT fully captured")
+    p = _rows(sub.add_parser("coverage", help="which types are NOT fully captured"))
     p.set_defaults(fn=cmd_coverage)
 
-    p = sub.add_parser("get", help="does this defName exist, and as what")
+    p = _rows(sub.add_parser("get", help="does this defName exist, and as what"))
     p.add_argument("def_name")
     p.set_defaults(fn=cmd_get)
 
-    p = sub.add_parser("tag", help="how many defs carry a tag")
+    p = _rows(sub.add_parser("tag", help="how many defs carry a tag"))
     p.add_argument("tag")
     p.add_argument("--kind", default="weaponTags")
     p.set_defaults(fn=cmd_tag)
 
-    p = sub.add_parser("flag", help="how many defs the ENGINE classifies this way")
+    p = _rows(sub.add_parser("flag", help="how many defs the ENGINE classifies this way"))
     p.add_argument("key")
     p.add_argument("--value", default="true")
     p.set_defaults(fn=cmd_flag)
 
-    p = sub.add_parser("verify", help="check sqlite against the json, type by type")
+    p = _rows(sub.add_parser("verify", help="check sqlite against the json, type by type"))
     p.add_argument("--only", nargs="*")
     p.set_defaults(fn=cmd_verify)
 
-    p = sub.add_parser("sql", help="read-only SELECT escape hatch")
+    p = _rows(sub.add_parser("sql", help="read-only SELECT escape hatch"))
     p.add_argument("query")
     p.set_defaults(fn=cmd_sql)
 
-    p = sub.add_parser("csv", help="count rows in a CSV without counting the header")
+    p = _rows(sub.add_parser("csv", help="count rows in a CSV without counting the header"))
     p.add_argument("path")
     p.add_argument("--where", help="col=value")
     p.set_defaults(fn=cmd_csv)
 
-    p = sub.add_parser("explain", help="what is this artifact and what may read it")
+    p = _rows(sub.add_parser("explain", help="what is this artifact and what may read it"))
     p.add_argument("path")
     p.set_defaults(fn=cmd_explain)
 
     args = ap.parse_args(argv)
+    if getattr(args, "rows_sub", None) is not None:
+        args.rows = args.rows_sub
     return args.fn(args)
 
 
