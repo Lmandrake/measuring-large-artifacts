@@ -320,6 +320,15 @@ def build(dump_dir: str, db_path: str = None, only=None, progress=None) -> Build
     collided, defs_lost = collision_report(declared_order)
 
     defs_dir = os.path.join(dump_dir, "defs")
+    # 🔴 Build to a TEMP file and rename at the end. The old code removed the
+    # db and rebuilt in place, so for the ~60 s of a rebuild every reader in
+    # every other window saw a missing file, then a partial one — observed as
+    # `database is locked` and then `database disk image is malformed`. A
+    # rename is atomic on the same filesystem, so a reader sees either the old
+    # db or the new one and never a half-written one. It also means a crashed
+    # build leaves the previous db intact instead of debris.
+    final_path = db_path
+    db_path = final_path + ".building"
     if os.path.exists(db_path):
         os.remove(db_path)
     con = sqlite3.connect(db_path)
@@ -534,6 +543,7 @@ def build(dump_dir: str, db_path: str = None, only=None, progress=None) -> Build
     con.execute("ANALYZE")
     con.commit()
     con.close()
+    os.replace(db_path, final_path)      # atomic; readers never see a partial db
     return stats
 
 
@@ -872,6 +882,72 @@ class DumpDB:
             artifact=f"is.{key}={value}", against=self.against,
             evidence=f"of {known} defs carrying the flag",
         )
+
+    def record(self, def_name: str, def_type: str = None):
+        """The full record for one name, as a Measurement carrying the dict.
+
+        🔑 Without this, every tool that needs a record's FIELDS had to drop to
+        `sql()` and hand-decode the json column — which puts it outside the
+        typed guarantee and back to interpreting raw rows. That was the single
+        biggest gap in this package: it could tell you how many, but not what.
+
+        The value is the parsed record. Coverage still gates it: a record from
+        a shadowed, orphan or partial slice is refused, because "here is the
+        record" implies "and it is the whole story", which it would not be.
+        """
+        stale = self._guard(def_name)
+        if stale:
+            return stale
+        q = ("SELECT def_type, json FROM defs WHERE def_name = ?"
+             + (" AND def_type = ?" if def_type else ""))
+        args = (def_name,) + ((def_type,) if def_type else ())
+        rows = self.con.execute(q, args).fetchall()
+        if not rows:
+            return Unmeasured(
+                reason="no record with this name in the capture",
+                artifact=def_name, instrument="dumpdb.record",
+                remedy="absence is only as good as coverage — run `coverage` "
+                       "and check the type is complete before concluding it "
+                       "does not exist")
+        if len(rows) > 1 and not def_type:
+            return Refused(
+                reason=f"{len(rows)} records share this name across types "
+                       f"({', '.join(sorted({r[0] for r in rows}))})",
+                artifact=def_name, instrument="dumpdb.record",
+                right_instrument="pass def_type= to disambiguate")
+        dt, blob = rows[0]
+        cov = self.con.execute(
+            "SELECT coverage, reason FROM capture WHERE def_type = ?",
+            (dt,)).fetchone()
+        if cov and cov[0] not in (COVERAGE_COMPLETE, COVERAGE_AMBIGUOUS):
+            return Unmeasured(
+                reason=f"the {dt} slice is {cov[0]}: {cov[1]}",
+                artifact=def_name, instrument="dumpdb.record",
+                remedy="the record may exist, but this capture cannot vouch "
+                       "for it; re-capture before relying on its fields")
+        return Measured(value=json.loads(blob), instrument="dumpdb.record",
+                        artifact=def_name, against=self.against,
+                        evidence=f"a {dt} record")
+
+    def records(self, def_type: str, limit: int = None):
+        """Every record of a type, as a Measurement carrying a list.
+
+        Refuses for exactly the reasons `count` refuses — iterating a slice the
+        capture cannot vouch for is how a partial dump becomes a confident
+        census.
+        """
+        n = self.count(def_type)
+        if not n.ok:
+            return n
+        q = "SELECT json FROM defs WHERE def_type = ?"
+        args = (def_type,)
+        if limit:
+            q += " LIMIT ?"
+            args += (limit,)
+        out = [json.loads(r[0]) for r in self.con.execute(q, args)]
+        return Measured(value=out, instrument="dumpdb.records",
+                        artifact=def_type, against=self.against,
+                        evidence=f"{len(out)} of {n.unwrap()} records")
 
     def sql(self, query: str, args=()):
         """Escape hatch. Returns raw rows — the caller owns the interpretation.

@@ -174,6 +174,15 @@ def cmd_flag(args) -> int:
     return emit(db.flag(args.key, value=args.value))
 
 
+def cmd_record(args) -> int:
+    db = _db(args)
+    m = db.record(args.def_name, def_type=args.type)
+    if m.ok and args.rows:
+        import json as _j
+        print(_j.dumps(m.unwrap(), indent=2)[: args.rows * 200])
+    return emit(m)
+
+
 def cmd_verify(args) -> int:
     db = _db(args)
     dump = args.dump or default_dump_dir()

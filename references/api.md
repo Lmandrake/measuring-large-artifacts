@@ -20,6 +20,7 @@
 | `measure coverage --rows 20` | name them individually with reasons |
 | `measure types [LIKE]` | which types exist |
 | `measure get <name>` | does this identifier exist, and as what |
+| `measure record <name> [--type T]` | the full record, still coverage-gated |
 | `measure tag <tag> [--kind K]` | how many records carry a tag (a join, not an index) |
 | `measure flag <key> [--value V]` | how many records the producer classified this way |
 | `measure csv <path> --where col=value` | count rows without counting the header |
@@ -105,6 +106,14 @@ Every public answer passes through that guard, so a stale artifact returns
 Staleness is decided by **capture stamp and input fingerprint, never mtime**. A
 built form whose source has been deleted is *not* stale — it is the only record
 left, and refusing to read it would help nobody.
+
+`record(name, def_type=None)` and `records(def_type, limit=None)` return the
+parsed record(s) as the Measurement's value, so a tool that needs FIELDS does not
+have to drop out of the typed guarantee to get them. Both are coverage-gated: a
+record from a shadowed or orphan slice is refused, because handing one over
+implies the capture can vouch for it. A name shared across types refuses rather
+than picking one — `Gun_Revolver` is a real `ThingDef`, `SymbolDef` **and**
+`WeaponAdjustmentDef`.
 
 `.sql(query)` returns raw rows rather than a Measurement, on purpose: the caller
 owns the interpretation, which is the risk the rest of the module removes. Use it

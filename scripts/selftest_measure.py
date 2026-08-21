@@ -805,6 +805,56 @@ def t_a_manifest_with_no_capture_stamp_is_not_silently_current():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def t_a_record_stays_inside_the_typed_guarantee():
+    """Retrieving FIELDS used to mean dropping to raw sql, i.e. leaving the
+    guarantee. `record()`/`records()` keep coverage in front of the data."""
+    tmp, db = synthetic_db()
+    try:
+        r = db.record("Gun_A")
+        assert r.ok, r.line()
+        assert r.unwrap()["defName"] == "Gun_A"
+        assert "<record:" in r.line(), "a record blew the one-line budget: %s" % r.line()
+        assert "\n" not in r.line()
+
+        rs = db.records("ThingDef")
+        assert rs.ok and len(rs.unwrap()) == 3, rs.line()
+        assert "<3 records>" in rs.line(), rs.line()
+
+        # a slice the capture cannot vouch for must not hand over records
+        assert not db.records("AbilityDef").ok
+        assert not db.record("NoSuchName").ok
+    finally:
+        db.close()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def t_an_ambiguous_name_refuses_rather_than_picking_one():
+    """Three real def types can share a defName. Returning one silently is a
+    confident wrong answer of exactly the kind this package exists to stop."""
+    db = _live()
+    try:
+        r = db.record("Gun_Revolver")
+        if r.ok:
+            raise _Skip("this capture has no name shared across types")
+        assert isinstance(r, Refused), r.line()
+        assert "def_type=" in r.line(), r.line()
+        one = db.record("Gun_Revolver", def_type="ThingDef")
+        assert one.ok and one.unwrap()["defType"] == "ThingDef"
+    finally:
+        db.close()
+
+
+def t_a_rebuild_never_shows_a_reader_a_partial_db():
+    """build wrote in place, so for the ~60 s of a rebuild every other window
+    saw a missing then a half-written file — observed as `database is locked`
+    and `disk image is malformed`."""
+    from measure.dumpdb import build as _b
+    import inspect
+    src = inspect.getsource(_b)
+    assert "os.replace(" in src, "build no longer renames atomically"
+    assert ".building" in src, "build no longer writes to a temp path"
+
+
 if __name__ == "__main__":
     for k, v in sorted(globals().items()):
         if k.startswith("t_"):

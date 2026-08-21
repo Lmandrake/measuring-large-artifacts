@@ -62,8 +62,22 @@ class Measured(Measurement):
     def unwrap(self) -> Any:
         return self.value
 
+    @staticmethod
+    def _render(v):
+        """Keep a measurement to one line even when the value is a record.
+
+        The whole design rests on a question costing one short line; a dict
+        printed inline is a screenful, and the caller who wants the fields has
+        `.unwrap()` for exactly that.
+        """
+        if isinstance(v, dict):
+            return f"<record: {len(v)} fields>"
+        if isinstance(v, (list, tuple)):
+            return f"<{len(v)} records>"
+        return v
+
     def line(self) -> str:
-        parts = [f"MEASURED {self.value} {self.artifact}"]
+        parts = [f"MEASURED {self._render(self.value)} {self.artifact}"]
         if self.evidence:
             parts.append(f"({self.evidence})")
         parts.append(f"via {self.instrument}")
