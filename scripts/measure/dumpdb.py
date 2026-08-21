@@ -40,7 +40,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from measure.result import (Measured, Unmeasured, Refused, Report,
                             UnmeasuredError)  # noqa: E402
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 DB_NAME = "defs.sqlite"
 
 SCHEMA = """
@@ -63,7 +63,17 @@ CREATE TABLE mods (
 -- point of this table: it is how absence stops being indistinguishable from
 -- ignorance.
 CREATE TABLE capture (
-    def_type       TEXT PRIMARY KEY,   -- simple type name, e.g. AbilityDef
+    -- 🔴 The IDENTITY of this capture slice, and it is NOT the simple name.
+    -- It was, and that was the bug: `def_type TEXT PRIMARY KEY` cannot hold two
+    -- types sharing a simple name, so a producer that had correctly separated
+    -- `Verse.AbilityDef` from `VFECore.Abilities.AbilityDef` into two files had
+    -- its work discarded on arrival — both rows collapsed and BOTH types' defs
+    -- were deleted. Measured 2026-08-21 against a capture from the fixed
+    -- producer: 630 AbilityDefs on disk, 0 in the table.
+    -- It is the full name when the manifest's `defTypes` index resolves one,
+    -- and the simple name otherwise (older captures, which cannot say).
+    capture_key    TEXT PRIMARY KEY,
+    def_type       TEXT NOT NULL,      -- simple type name, e.g. AbilityDef
     full_name      TEXT,               -- namespace-qualified, when known
     source_file    TEXT,               -- the defs/<x>.json it came from
     declared_count INTEGER,            -- what manifest.json said
@@ -111,6 +121,7 @@ CREATE TABLE def_tags (
     tag    TEXT NOT NULL
 );
 
+CREATE INDEX idx_capture_ty ON capture(def_type);
 CREATE INDEX idx_defs_name  ON defs(def_name);
 CREATE INDEX idx_defs_type  ON defs(def_type);
 CREATE INDEX idx_defs_conc  ON defs(concrete_type);
@@ -365,6 +376,14 @@ def build(dump_dir: str, db_path: str = None, only=None, progress=None) -> Build
     # happened, not who won.
     def_types = {d.get("name") or d.get("fullName"): d
                  for d in (manifest.get("defTypes") or [])}
+    # 🔴 Keyed on FILE, because that is the only field of `defTypes` that is
+    # UNIQUE. The map above is keyed on `name`, which for a collided name keeps
+    # only the last of three — the same shape of loss this package exists to
+    # stop, one level up. Keep both: `def_types` answers "is there an index at
+    # all", `by_file` answers "which type is THIS file", which is the question
+    # that resolves the collision.
+    by_file = {d.get("file"): d for d in (manifest.get("defTypes") or [])
+               if d.get("file")}
     prov["has_def_types_map"] = "1" if def_types else "0"
     prov["defcount_entries"] = str(sum(len(v) for v in declared_order.values()))
     prov["defcount_names"] = str(len(declared_order))
@@ -391,8 +410,8 @@ def build(dump_dir: str, db_path: str = None, only=None, progress=None) -> Build
             header, it = iter_defs(path)
         except Exception as ex:                      # unreadable / truncated
             con.execute(
-                "INSERT OR REPLACE INTO capture VALUES (?,?,?,?,?,?,?,?)",
-                (stem, None, fname, declared.get(stem), None, 0,
+                "INSERT OR REPLACE INTO capture VALUES (?,?,?,?,?,?,?,?,?)",
+                (stem, stem, None, fname, declared.get(stem), None, 0,
                  COVERAGE_FAILED, f"cannot read: {ex}"),
             )
             stats.failed += 1
@@ -401,33 +420,64 @@ def build(dump_dir: str, db_path: str = None, only=None, progress=None) -> Build
         inner_type = header.get("defType") or stem
         full_name = header.get("defTypeFull") or None
         file_count = header.get("fileCount")
-        if inner_type in seen_types:
-            # Two FILES claiming the same inner defType. `capture` is keyed on
-            # def_type so the second row replaces the first, while `defs` rows
-            # accumulate — count said 3 where the table held 6. That is the
-            # keying mistake this package is written about, committed one layer
-            # up, in the reader. Refuse rather than merge: we cannot know which
-            # file owns which records. Found by red team 2026-08-21.
+        # ⭐ WHICH type is this file? A fixed producer answers it outright, and
+        # this is the whole point of the `defTypes` index: the loser of a simple
+        # -name collision is written as `<FullName>.json` and the index maps
+        # that file to its full type. When the index resolves it, the capture is
+        # keyed on the FULL name and the two slices coexist. When there is no
+        # index — every capture before 2026-08-21 — nothing has changed and the
+        # simple name is still the only identity available.
+        entry = by_file.get(fname)
+        if entry:
+            full_name = entry.get("fullName") or full_name
+            inner_type = entry.get("name") or inner_type
+        key = (full_name or inner_type) if entry else inner_type
+        # ⚠️ The manifest's `defCounts` is keyed on the FILE STEM in a fixed
+        # producer and on the simple name in an old one. Try the stem first —
+        # for the 517 uncollided types they are the same string anyway.
+        declared_here = declared.get(stem)
+        if declared_here is None:
+            declared_here = declared.get(inner_type)
+        if key in seen_types:
+            # Two FILES claiming the same IDENTITY. Refuse rather than merge:
+            # nothing can say which file owns which records. Found by red team
+            # 2026-08-21, when `defs` rows accumulated while `capture` was
+            # overwritten — count said 3 where the table held 6.
+            #
+            # ⚠️ **`key` is the full name whenever the manifest resolves it**, so
+            # a producer that separated `Verse.AbilityDef` from
+            # `VFECore.Abilities.AbilityDef` no longer lands here at all. That
+            # was the second half of the same bug: this branch fired on a
+            # capture that HAD recorded which records belong to which, deleted
+            # both slices, and reported them in the build total anyway — 630
+            # AbilityDefs on disk, 0 in the table. Measured 2026-08-21.
+            n_gone = con.execute(
+                "SELECT COUNT(*) FROM defs WHERE def_type = ?",
+                (inner_type,)).fetchone()[0]
             con.execute("DELETE FROM defs WHERE def_type = ?", (inner_type,))
+            stats.defs_inserted -= n_gone     # never report rows we just removed
             con.execute(
-                "INSERT OR REPLACE INTO capture VALUES (?,?,?,?,?,?,?,?)",
-                (inner_type, full_name, f"{seen_types[inner_type]}, {fname}",
-                 declared.get(inner_type), None, 0, COVERAGE_SHADOWED,
+                "INSERT OR REPLACE INTO capture VALUES (?,?,?,?,?,?,?,?,?)",
+                (key, inner_type, full_name, f"{seen_types[key]}, {fname}",
+                 declared_here, None, 0, COVERAGE_SHADOWED,
                  f"two files claim defType={inner_type} "
-                 f"({seen_types[inner_type]} and {fname}); the dump does not "
+                 f"({seen_types[key]} and {fname}); the dump does not "
                  f"record which records belong to which, so neither is counted"))
             stats.shadowed += 1
             continue
-        seen_types[inner_type] = fname
+        seen_types[key] = fname
 
         # 🔴 Decide BEFORE ingesting. An orphan's defs must never reach the
         # `defs` table — being able to answer about them is the bug.
-        if inner_type not in declared_order:
+        # ⚠️ `entry` means the manifest's defTypes index names this file, which
+        # is a declaration by a better route than defCounts — so an indexed file
+        # is never an orphan even when defCounts is keyed on the other string.
+        if not entry and inner_type not in declared_order and stem not in declared_order:
             n = sum(1 for _ in it)          # counted, so the refusal can say how many
             cov, reason = _coverage(inner_type, stem, declared_order, file_count, n)
             con.execute(
-                "INSERT OR REPLACE INTO capture VALUES (?,?,?,?,?,?,?,?)",
-                (inner_type, full_name, fname, None, file_count, 0, cov, reason),
+                "INSERT OR REPLACE INTO capture VALUES (?,?,?,?,?,?,?,?,?)",
+                (key, inner_type, full_name, fname, None, file_count, 0, cov, reason),
             )
             stats.types_seen += 1
             stats.orphan += 1
@@ -474,20 +524,21 @@ def build(dump_dir: str, db_path: str = None, only=None, progress=None) -> Build
             # commonest damage, and one bad file aborted the entire build.
             _flush(con, rows, flagrows, tagrows)
             con.execute(
-                "INSERT OR REPLACE INTO capture VALUES (?,?,?,?,?,?,?,?)",
-                (inner_type, full_name, fname, declared.get(inner_type),
+                "INSERT OR REPLACE INTO capture VALUES (?,?,?,?,?,?,?,?,?)",
+                (key, inner_type, full_name, fname, declared_here,
                  file_count, n, COVERAGE_FAILED,
                  f"read failed after {n} defs: {ex}"))
             con.execute("DELETE FROM defs WHERE def_type = ?", (inner_type,))
             stats.failed += 1
             stats.types_seen += 1
-            seen_types[inner_type] = fname
+            seen_types[key] = fname
             continue
         _flush(con, rows, flagrows, tagrows)
 
         stats.types_seen += 1
         stats.defs_inserted += n
-        cov, reason = _coverage(inner_type, stem, declared_order, file_count, n)
+        cov, reason = _coverage(inner_type, stem, declared_order, file_count, n,
+                                resolved=bool(entry), declared_here=declared_here)
         if cov == COVERAGE_PARTIAL:
             stats.partial += 1
         elif cov == COVERAGE_SHADOWED:
@@ -495,8 +546,8 @@ def build(dump_dir: str, db_path: str = None, only=None, progress=None) -> Build
         elif cov == COVERAGE_AMBIGUOUS:
             stats.ambiguous += 1
         con.execute(
-            "INSERT OR REPLACE INTO capture VALUES (?,?,?,?,?,?,?,?)",
-            (inner_type, full_name, fname, declared.get(inner_type),
+            "INSERT OR REPLACE INTO capture VALUES (?,?,?,?,?,?,?,?,?)",
+            (key, inner_type, full_name, fname, declared_here,
              file_count, n, cov, reason),
         )
         if progress:
@@ -507,6 +558,12 @@ def build(dump_dir: str, db_path: str = None, only=None, progress=None) -> Build
     # keys on the simple name this is a collision: two types shared a name and
     # the loser was overwritten. It must read `absent`, never 0.
     already = {r[0] for r in con.execute("SELECT def_type FROM capture")}
+    already |= {r[0] for r in con.execute("SELECT capture_key FROM capture")}
+    # ⚠️ And every FILE STEM a resolved capture consumed. A fixed producer keys
+    # defCounts on the stem, so `VFECore_Abilities_AbilityDef` appears there as
+    # a name — with no file whose header carries it, since the header holds the
+    # SIMPLE name. Without this it was swept in as a phantom `absent` type.
+    already |= {os.path.splitext(f)[0] for f in seen_types.values()}
     for t, counts in declared_order.items():
         if t in seen_types or t in already:
             # A row already exists — typically `failed` from a damaged file.
@@ -529,8 +586,8 @@ def build(dump_dir: str, db_path: str = None, only=None, progress=None) -> Build
             )
             stats.absent += 1
         con.execute(
-            "INSERT OR REPLACE INTO capture VALUES (?,?,?,?,?,?,?,?)",
-            (t, None, None, count, None, 0, cov, reason),
+            "INSERT OR REPLACE INTO capture VALUES (?,?,?,?,?,?,?,?,?)",
+            (t, t, None, None, count, None, 0, cov, reason),
         )
 
     # Written LAST on purpose: its presence is what marks the build complete,
@@ -570,7 +627,8 @@ def _flush(con, rows, flagrows, tagrows):
         con.executemany("INSERT INTO def_tags VALUES (?,?,?)", tagrows)
 
 
-def _coverage(inner_type, stem, declared_order, file_count, loaded):
+def _coverage(inner_type, stem, declared_order, file_count, loaded,
+              resolved=False, declared_here=None):
     """Decide what this file's capture is worth.
 
     ⚠️ Three sources agreeing is NOT the test, and believing it was is how the
@@ -580,6 +638,21 @@ def _coverage(inner_type, stem, declared_order, file_count, loaded):
     The duplicate-key evidence is checked FIRST, before any agreement counts
     for anything.
     """
+    if resolved:
+        # ⭐ The manifest's `defTypes` index named which type owns this FILE, so
+        # the simple-name collision is answered, not merely detected. Nothing
+        # was lost and nothing is ambiguous — the only question left is whether
+        # this file parsed completely, which is the ordinary check below.
+        note = (f"simple name '{inner_type}' is shared, resolved by the "
+                f"manifest's defTypes index to defs/{stem}.json")
+        if file_count is not None and loaded != file_count:
+            return COVERAGE_PARTIAL, (
+                f"file declares {file_count} defs, {loaded} parsed; {note}")
+        if declared_here is not None and loaded != declared_here:
+            return COVERAGE_PARTIAL, (
+                f"manifest declares {declared_here} defs, {loaded} parsed; {note}")
+        return COVERAGE_COMPLETE, (note if stem != inner_type else None)
+
     written = declared_order.get(inner_type)
     if written is None:
         return COVERAGE_ORPHAN, (
@@ -738,10 +811,29 @@ class DumpDB:
         stale = self._guard(def_type)
         if stale:
             return stale
-        row = self.con.execute(
-            "SELECT coverage, reason, declared_count, loaded_count "
-            "FROM capture WHERE def_type = ?", (def_type,)
-        ).fetchone()
+        rows = self.con.execute(
+            "SELECT coverage, reason, declared_count, loaded_count, capture_key "
+            "FROM capture WHERE def_type = ? OR capture_key = ?",
+            (def_type, def_type)
+        ).fetchall()
+        # ⭐ A simple name can now name MORE THAN ONE slice, because a resolved
+        # collision keeps both instead of discarding both. That is a better
+        # problem than the one it replaces: the defs are all present, and the
+        # question "how many AbilityDefs" simply has two honest answers.
+        # ⛔ Do NOT sum them — they are different types that happen to share a
+        # short name, and adding them invents a quantity nothing measured.
+        if len(rows) > 1:
+            parts = ", ".join(f"{r[4]} ({r[3]})" for r in rows)
+            return Unmeasured(
+                reason=f"'{def_type}' is the simple name of {len(rows)} distinct "
+                       f"def types in this capture: {parts}. They are different "
+                       f"types and their counts must not be added.",
+                artifact=def_type,
+                instrument="dumpdb.count",
+                remedy="ask for the one you mean by its full name, e.g. "
+                       + " or ".join(f"`measure count {r[4]}`" for r in rows[:2]),
+            )
+        row = rows[0] if rows else None
         if row is None:
             return Unmeasured(
                 reason=f"no def type named {def_type} in this capture "
@@ -751,7 +843,7 @@ class DumpDB:
                 remedy="check the spelling with `measure types <substring>`; the dump only "
                        "holds types the running game had loaded",
             )
-        coverage, reason, declared, loaded = row
+        coverage, reason, declared, loaded = row[0], row[1], row[2], row[3]
         if coverage == COVERAGE_AMBIGUOUS:
             return Measured(
                 value=loaded, instrument="dumpdb.count", artifact=def_type,
@@ -951,7 +1043,8 @@ class DumpDB:
         n = self.count(def_type)
         if not n.ok:
             return n
-        q = "SELECT json FROM defs WHERE def_type = ?"
+        q = ("SELECT json FROM defs WHERE def_type = ? OR full_name = ?"
+             if "." in def_type else "SELECT json FROM defs WHERE def_type = ?")
         args = (def_type,)
         if limit:
             q += " LIMIT ?"

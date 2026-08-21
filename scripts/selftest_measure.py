@@ -27,7 +27,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)          # this skill's scripts/ dir holds the package
 
 from measure import artifacts                                      # noqa: E402
-from measure.dumpdb import (                                       # noqa: E402
+from measure.dumpdb import (
+    SCHEMA_VERSION,                                       # noqa: E402
     DumpDB, DB_NAME, build, default_dump_dir, iter_defs,
 )
 from measure.result import (                                       # noqa: E402
@@ -327,11 +328,37 @@ def t_csv_count_excludes_the_header():
 # live — only if a real db has been built
 # --------------------------------------------------------------------------
 
-def _live():
+def _live_db_path():
+    """The live db, or a SKIP that says which — absent, or built by an older
+    schema.
+
+    🔑 **A schema bump must not make this suite unrunnable.** `defs.sqlite` is
+    DERIVED and the documented remedy is `measure build`; until someone runs it
+    the live db is simply not a thing this code can read, which is a check that
+    COULD NOT RUN rather than one that failed. Reporting it as ERROR made nine
+    tests red on a working tree the moment SCHEMA_VERSION moved 2 -> 3, and a
+    red suite nobody can green is a suite people stop reading.
+    """
     p = os.path.join(default_dump_dir(), DB_NAME)
     if not os.path.exists(p):
         raise _Skip("no %s yet — run `measure build` (this is a SKIP, not a pass)" % p)
-    return DumpDB(p)
+    try:
+        import sqlite3
+        con = sqlite3.connect(p)
+        sv = dict(con.execute("SELECT key, value FROM provenance")).get(
+            "schema_version")
+        con.close()
+    except Exception:
+        sv = None
+    if sv is not None and int(sv) != SCHEMA_VERSION:
+        raise _Skip("the live db is schema v%s and this code is v%d — run "
+                    "`measure build` to rebuild it (SKIP, not a pass)"
+                    % (sv, SCHEMA_VERSION))
+    return p
+
+
+def _live():
+    return DumpDB(_live_db_path())
 
 
 def t_live_abilitydef_is_the_known_wrong_answer_and_is_caught():
@@ -658,8 +685,7 @@ def t_detail_flags_never_change_the_verdict():
     """`--rows` asks for more output; it must not turn UNMEASURED into success."""
     import subprocess
     cli = os.path.join(HERE, "measure", "cli.py")
-    if not os.path.exists(os.path.join(default_dump_dir(), DB_NAME)):
-        raise _Skip("no live db")
+    _live_db_path()
     bare = subprocess.run([sys.executable, cli, "coverage"],
                           capture_output=True, text=True).returncode
     detail = subprocess.run([sys.executable, cli, "coverage", "--rows", "3"],
@@ -672,14 +698,163 @@ def t_detail_flags_never_change_the_verdict():
 # red team, 2026-08-21 — five criticals. Each is pinned here.
 # --------------------------------------------------------------------------
 
+# --------------------------------------------------------------------------
+# A FIXED producer's capture — `defTypes` resolves the collision, 2026-08-21.
+#
+# 🔴 These lock in the bug that a producer fix ALONE could not close. RimDefDump
+# d7cf154 separated `Verse.AbilityDef` from `VFECore.Abilities.AbilityDef` into
+# two files and added a `defTypes` index saying which is which — and this reader
+# threw the work away, because `capture` was keyed on the SIMPLE name and could
+# not hold two rows. Measured on a faithful synthetic before the load that would
+# have produced it: 630 AbilityDefs on disk, **0** in the table, and `build`
+# reporting 615 while the table held 3.
+# --------------------------------------------------------------------------
+
+def make_fixed_dump(tmp):
+    """A capture in the shape RimDefDump d7cf154 writes.
+
+    Faithful to the producer, checked against DefDumper.cs rather than assumed:
+      * the file HEADER carries the SIMPLE name (`DefDumper.cs:510`), so both
+        AbilityDef files say `defType: "AbilityDef"` — the index is the only
+        thing that separates them
+      * `defCounts` is keyed on the FILE STEM (`DefDumper.cs:183-186`), not the
+        type name, so there are no duplicate keys any more
+      * the loser is written as `SafeFileName(FullName).json` (`:479`)
+    """
+    defs_dir = os.path.join(tmp, "defs")
+    os.makedirs(defs_dir, exist_ok=True)
+
+    def write(stem, simple, full, n):
+        body = [{"defName": "%s_%d" % (stem, i), "defType": simple,
+                 "defTypeFull": full, "label": None, "shortHash": 5000 + i,
+                 "modName": "Core", "packageId": "ludeon.rimworld", "fields": {}}
+                for i in range(n)]
+        with open(os.path.join(defs_dir, stem + ".json"), "w", encoding="utf-8") as fh:
+            json.dump({"defType": simple, "defTypeFullName": full,
+                       "defs": body, "count": n}, fh, separators=(",", ":"))
+
+    write("ThingDef", "ThingDef", "Verse.ThingDef", 3)
+    write("AbilityDef", "AbilityDef", "Verse.AbilityDef", 612)
+    write("VFECore_Abilities_AbilityDef", "AbilityDef",
+          "VFECore.Abilities.AbilityDef", 18)
+    manifest = {
+        "tool": "RimDefDump", "toolVersion": "1.0", "mode": "all",
+        "capturedUtc": "2026-08-22T09:00:00Z", "gameVersion": "1.6 test",
+        "modCount": 1,
+        "mods": [{"loadOrder": 1, "name": "Core", "packageId": "ludeon.rimworld",
+                  "rootDir": "/x"}],
+        "defCounts": {"ThingDef": 3, "AbilityDef": 612,
+                      "VFECore_Abilities_AbilityDef": 18},
+        "defTypes": [
+            {"name": "ThingDef", "fullName": "Verse.ThingDef",
+             "assembly": "Assembly-CSharp", "file": "ThingDef.json", "count": 3},
+            {"name": "AbilityDef", "fullName": "Verse.AbilityDef",
+             "assembly": "Assembly-CSharp", "file": "AbilityDef.json", "count": 612},
+            {"name": "AbilityDef", "fullName": "VFECore.Abilities.AbilityDef",
+             "assembly": "VFECore", "file": "VFECore_Abilities_AbilityDef.json",
+             "count": 18}],
+        "defTypeCollisions": ["AbilityDef"],
+        "defTypeCount": 3,
+    }
+    with open(os.path.join(tmp, "manifest.json"), "w", encoding="utf-8") as fh:
+        json.dump(manifest, fh)
+    return tmp
+
+
+def _fixed():
+    tmp = tempfile.mkdtemp(prefix="measure_fixed_")
+    make_fixed_dump(tmp)
+    build(tmp)
+    return tmp, DumpDB(os.path.join(tmp, DB_NAME))
+
+
+def t_a_resolved_collision_keeps_BOTH_types():
+    """The one the producer fix exists for. Neither slice may be dropped."""
+    tmp, db = _fixed()
+    try:
+        rows = {r[0]: r for r in db.sql(
+            "SELECT capture_key, def_type, loaded_count, coverage FROM capture")}
+        assert set(rows) == {"Verse.ThingDef", "Verse.AbilityDef",
+                             "VFECore.Abilities.AbilityDef"}, sorted(rows)
+        for k, r in rows.items():
+            assert r[3] == "complete", "%s is %s, not complete" % (k, r[3])
+        assert rows["Verse.AbilityDef"][2] == 612
+        assert rows["VFECore.Abilities.AbilityDef"][2] == 18
+        total = db.sql("SELECT COUNT(*) FROM defs")[0][0]
+        assert total == 633, "the table holds %d defs, expected 633" % total
+    finally:
+        db.close(); shutil.rmtree(tmp, ignore_errors=True)
+
+
+def t_build_reports_the_rows_it_actually_holds():
+    """🔴 `build` announced 615 while the table held 3. defs_inserted was counted
+    before the shadowed rows were deleted, so the summary and the table told
+    different stories about the same capture — this package's own named failure
+    mode, inside the package."""
+    tmp = tempfile.mkdtemp(prefix="measure_fixed_")
+    try:
+        make_fixed_dump(tmp)
+        stats = build(tmp)
+        db = DumpDB(os.path.join(tmp, DB_NAME))
+        try:
+            held = db.sql("SELECT COUNT(*) FROM defs")[0][0]
+        finally:
+            db.close()
+        assert stats.defs_inserted == held, (
+            "build reported %d defs, the table holds %d"
+            % (stats.defs_inserted, held))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def t_a_full_name_counts_exactly():
+    tmp, db = _fixed()
+    try:
+        m = db.count("Verse.AbilityDef")
+        assert m.ok and m.unwrap() == 612, m
+        m2 = db.count("VFECore.Abilities.AbilityDef")
+        assert m2.ok and m2.unwrap() == 18, m2
+    finally:
+        db.close(); shutil.rmtree(tmp, ignore_errors=True)
+
+
+def t_a_shared_simple_name_refuses_and_never_sums():
+    """⛔ 612 + 18 = 630 is a quantity nothing measured. The honest answer names
+    both types and hands over the two commands that DO have answers."""
+    tmp, db = _fixed()
+    try:
+        m = db.count("AbilityDef")
+        assert not m.ok, "a shared simple name returned a number: %s" % m
+        text = str(m)
+        assert "630" not in text, "it summed two different types: %s" % text
+        assert "Verse.AbilityDef" in text and "VFECore.Abilities.AbilityDef" in text
+        assert "measure count Verse.AbilityDef" in text, (
+            "the refusal does not hand over a command that works: %s" % text)
+    finally:
+        db.close(); shutil.rmtree(tmp, ignore_errors=True)
+
+
+def t_the_fixed_shape_invents_no_phantom_types():
+    """`defCounts` keyed on the file stem put `VFECore_Abilities_AbilityDef` in
+    the manifest as a NAME, with no file whose header carries it — and the
+    absent-sweep swept it in as a type that does not exist."""
+    tmp, db = _fixed()
+    try:
+        keys = [r[0] for r in db.sql("SELECT capture_key FROM capture")]
+        assert "VFECore_Abilities_AbilityDef" not in keys, (
+            "a file stem was recorded as a def type: %s" % keys)
+        assert len(keys) == 3, keys
+    finally:
+        db.close(); shutil.rmtree(tmp, ignore_errors=True)
+
+
 def t_the_escape_hatch_never_mints_a_measurement():
     """🔴 `sql` returned `MEASURED 0` for the canonical wrong number, exit 0,
     with the artifact's provenance stamped on it — while `count` on the same db
     in the same second refused. A raw row carries no coverage."""
     import subprocess
     cli = os.path.join(HERE, "measure", "cli.py")
-    if not os.path.exists(os.path.join(default_dump_dir(), DB_NAME)):
-        raise _Skip("no live db")
+    _live_db_path()
     r = subprocess.run(
         [sys.executable, cli, "sql",
          "SELECT loaded_count FROM capture WHERE def_type='AbilityDef'"],
