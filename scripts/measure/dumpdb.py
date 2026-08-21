@@ -646,6 +646,18 @@ class DumpDB:
             raise FileNotFoundError(db_path)
         self.con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         self.prov = dict(self.con.execute("SELECT key, value FROM provenance"))
+        sv = self.prov.get("schema_version")
+        if sv and int(sv) != SCHEMA_VERSION:
+            # 🔑 This is why a DERIVED artifact must never be frozen: freezing
+            # it freezes its BUGS. Schema 1 keyed rows on each record's concrete
+            # subclass, so `count` and a COUNT(*) over the rows disagreed. A db
+            # pinned at schema 1 would serve that disagreement forever against
+            # an otherwise-correct capture. Rebuilding is cheap; being wrong is
+            # not.
+            raise ValueError(
+                f"{db_path} was built by schema v{sv}; this code is v"
+                f"{SCHEMA_VERSION}. Re-run `measure build` — the db is derived "
+                f"from the capture and is meant to be rebuilt, never frozen.")
         if not self.prov.get("schema_version"):
             # `build` writes provenance LAST, so a db with none is the debris of
             # a crashed build. Left unchecked it reported "MEASURED 0 def types
