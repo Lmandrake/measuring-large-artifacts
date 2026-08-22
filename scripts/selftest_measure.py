@@ -29,7 +29,7 @@ sys.path.insert(0, HERE)          # this skill's scripts/ dir holds the package
 from measure import artifacts                                      # noqa: E402
 from measure.dumpdb import (
     SCHEMA_VERSION,                                       # noqa: E402
-    DumpDB, DB_NAME, build, default_dump_dir, iter_defs,
+    DumpDB, DB_NAME, build, default_dump_dir, iter_defs, split_capture_layout,
 )
 from measure.result import (                                       # noqa: E402
     Measured, Refused, Report, Unmeasured, UnmeasuredError,
@@ -457,7 +457,7 @@ def t_agreement_between_corrupted_sources_is_not_completeness():
 def t_live_the_824_defs_are_found_offline_with_no_game():
     """The real dump, the real number, no RimWorld and no new DLL required."""
     from measure.dumpdb import read_manifest, collision_report
-    path = os.path.join(default_dump_dir(), "manifest.json")
+    path = os.path.join(split_capture_layout(default_dump_dir())[1], "manifest.json")
     if not os.path.exists(path):
         raise _Skip("no live dump at %s" % path)
     _, order = read_manifest(path)
@@ -597,7 +597,7 @@ def t_live_the_db_holds_exactly_what_the_manifest_DECLARES():
     from measure.dumpdb import read_manifest
     db = _live()
     try:
-        path = os.path.join(default_dump_dir(), "manifest.json")
+        path = os.path.join(split_capture_layout(default_dump_dir())[1], "manifest.json")
         _, order = read_manifest(path)
         declared_sum = sum(v[-1] for v in order.values())
         actual = db.sql("SELECT COUNT(*) FROM defs")[0][0]
@@ -659,7 +659,7 @@ def t_live_verify_reconciles_with_coverage():
     """
     db = _live()
     try:
-        rep = db.verify_against_json(default_dump_dir())
+        rep = db.verify_against_json(split_capture_layout(default_dump_dir())[1])
         bad = [r.artifact for r in rep.unmeasured]
         assert not bad, (
             "verify reports %d disagreements that coverage does not explain: %s"

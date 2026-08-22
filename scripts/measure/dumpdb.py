@@ -1121,5 +1121,46 @@ def default_dump_dir() -> str:
             "RimWorld by Ludeon Studios/DefDump")
 
 
+#: A dated capture directory: the ISO-8601 instant it was taken, with ':' made
+#: filesystem safe. `2026-08-21T22-44-59Z`.
+_CAPTURE_ID = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}Z$")
+
+
+def split_capture_layout(path: str):
+    """-> (root, source) for a dump that may or may not use dated captures.
+
+    🔴 A DUMP CAN HOLD MANY CAPTURES, AND THE DATABASE IS NOT ONE OF THEM.
+    A producer that keeps history writes `<root>/captures/<id>/manifest.json`
+    and prunes old ids. `defs.sqlite` is DERIVED from whichever capture is
+    current, so it belongs at `<root>` — outside every capture — or pruning a
+    capture would delete the database and rebuilding the database would look
+    like a new capture.
+
+    ⇒ Reading and writing want DIFFERENT directories, which is the whole reason
+    this exists:
+        root   where `defs.sqlite` lives
+        source where `manifest.json` and `defs/` live — the newest capture
+
+    A flat dump with no `captures/` returns the same path twice, so a caller
+    written against this works on both layouts with no flag day.
+
+    `path` may be the root or a capture; both are understood.
+    """
+    path = os.path.abspath(path)
+    head, tail = os.path.split(path)
+    if os.path.basename(head) == "captures" and _CAPTURE_ID.match(tail):
+        return os.path.dirname(head), path          # handed a capture
+    caps = os.path.join(path, "captures")
+    try:
+        ids = sorted(d for d in os.listdir(caps)
+                     if _CAPTURE_ID.match(d) and os.path.isdir(os.path.join(caps, d)))
+    except OSError:
+        return path, path                           # flat layout, or no dump at all
+    if not ids:
+        return path, path
+    # Fixed-width ISO-8601, so an ordinal sort IS chronological. No date parsing.
+    return path, os.path.join(caps, ids[-1])
+
+
 def open_default() -> DumpDB:
     return DumpDB(os.path.join(default_dump_dir(), DB_NAME))

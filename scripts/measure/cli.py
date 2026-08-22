@@ -35,7 +35,7 @@ from measure.result import Measured, Unmeasured, Refused  # noqa: E402
 from measure import artifacts  # noqa: E402
 from measure import playerlog  # noqa: E402
 from measure.dumpdb import (  # noqa: E402
-    DumpDB, DB_NAME, build, default_dump_dir,
+    DumpDB, DB_NAME, build, default_dump_dir, split_capture_layout,
 )
 
 EXIT = {"MEASURED": 0, "UNMEASURED": 2, "REFUSED": 3}
@@ -75,8 +75,14 @@ def _db(args) -> DumpDB:
 # --------------------------------------------------------------------------
 
 def cmd_build(args) -> int:
-    dump = args.dump or default_dump_dir()
-    stats = build(dump, db_path=args.db, only=set(args.only) if args.only else None)
+    # 🔑 READ THE CAPTURE, WRITE THE DATABASE BESIDE IT AT THE ROOT. Under a dated
+    # layout `manifest.json` and `defs/` are inside `captures/<id>/` while
+    # `defs.sqlite` stays at the root, so building from one path would either fail
+    # to find the manifest or bury the database inside a capture that gets pruned.
+    # A flat dump returns the same path twice and nothing changes for it.
+    root, dump = split_capture_layout(args.dump or default_dump_dir())
+    stats = build(dump, db_path=args.db or os.path.join(root, DB_NAME),
+                  only=set(args.only) if args.only else None)
     print(
         f"MEASURED {stats.defs_inserted} defs built from {dump} "
         f"({stats.types_seen} types; absent={stats.absent} "
@@ -187,7 +193,9 @@ def cmd_record(args) -> int:
 
 def cmd_verify(args) -> int:
     db = _db(args)
-    dump = args.dump or default_dump_dir()
+    # Cross-checks the db against the JSON it was built from, so it must read the
+    # CAPTURE, not the root that merely holds captures. See split_capture_layout.
+    _root, dump = split_capture_layout(args.dump or default_dump_dir())
     rep = db.verify_against_json(dump, limit_types=set(args.only) if args.only else None)
     bad = rep.unmeasured
     if args.rows:
