@@ -1076,6 +1076,23 @@ class DumpDB:
         """
         rep = Report()
         defs_dir = os.path.join(dump_dir, "defs")
+
+        # 🔴 A FILE, NOT A SIMPLE NAME, IS WHAT THIS COMPARES.
+        # Once the producer resolves a filename collision it writes `AbilityDef.json`
+        # for `RimWorld.AbilityDef` AND `VEF.Abilities.AbilityDef.json` for the other
+        # one. Both carry the simple name `AbilityDef`, so keying the comparison on
+        # that name asked "does this ONE file hold every AbilityDef in the db" — and
+        # of course it does not: 612 in one file, 18 in the other, 630 in the db.
+        # ⚠️ It reported 22 disagreements on this machine's dump and every one was
+        # the instrument's arithmetic, not a real json-vs-sqlite gap. Measured
+        # 2026-08-22. The `capture` table already records which file each type came
+        # from, so `source_file` is the join and `full_name` is what to count.
+        by_file = {}
+        for src, full, cov in self.con.execute(
+                "SELECT source_file, full_name, coverage FROM capture "
+                "WHERE source_file IS NOT NULL"):
+            by_file[src] = (full, cov)
+
         for fname in sorted(os.listdir(defs_dir)):
             if not fname.endswith(".json"):
                 continue
@@ -1088,19 +1105,31 @@ class DumpDB:
                 rep.add(Unmeasured(reason=str(ex), artifact=stem,
                                    instrument="verify_against_json"))
                 continue
-            inner = header.get("defType") or stem
+
+            full, cov = by_file.get(fname, (None, None))
+            # ⚠️ Older captures have no `source_file`, so fall back to the simple
+            # name exactly as before. Those captures also predate the collision fix,
+            # which is why the fallback is right rather than merely tolerant.
+            inner = full or header.get("defType") or stem
+            if cov is None:
+                row = self.con.execute(
+                    "SELECT coverage FROM capture WHERE def_type = ?", (inner,)
+                ).fetchone()
+                cov = row[0] if row else None
             n = sum(1 for _ in it)
-            cov = self.con.execute(
-                "SELECT coverage FROM capture WHERE def_type = ?", (inner,)
-            ).fetchone()
-            if cov and cov[0] == COVERAGE_ORPHAN:
+            if cov == COVERAGE_ORPHAN:
                 # Excluded deliberately, not lost. Reporting it as a
                 # json-vs-sqlite disagreement would send the reader to
                 # "rebuild the db", which cannot and must not change it.
                 continue
-            db_n = self.con.execute(
-                "SELECT COUNT(*) FROM defs WHERE def_type = ?", (inner,)
-            ).fetchone()[0]
+            if full:
+                db_n = self.con.execute(
+                    "SELECT COUNT(*) FROM defs WHERE full_name = ?", (full,)
+                ).fetchone()[0]
+            else:
+                db_n = self.con.execute(
+                    "SELECT COUNT(*) FROM defs WHERE def_type = ?", (inner,)
+                ).fetchone()[0]
             if n == db_n:
                 rep.add(Measured(value=n, instrument="verify_against_json",
                                  artifact=inner, against=self.against))
