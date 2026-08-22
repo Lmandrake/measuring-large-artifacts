@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import csv as _csv
+import hashlib as _hashlib
 import os
 import sys
 
@@ -32,6 +33,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from measure.result import Measured, Unmeasured, Refused  # noqa: E402
 from measure import artifacts  # noqa: E402
+from measure import playerlog  # noqa: E402
 from measure.dumpdb import (  # noqa: E402
     DumpDB, DB_NAME, build, default_dump_dir,
 )
@@ -260,6 +262,18 @@ def cmd_csv(args) -> int:
             return emit(Refused(reason="--where wants col=value", artifact=path,
                                 instrument="measure.csv"))
         col, val = args.where.split("=", 1)
+    # 🔑 PROVENANCE, added for LOG_AND_CSV_GET_INSTRUMENTS_1. A count with no
+    # fingerprint cannot say WHICH revision of the world it is a count of, which is
+    # the same gap the def dump had before `provenance` - and the world CSVs are
+    # re-emitted every time the planet is repainted. sha256 over the whole file is
+    # affordable here precisely because these are ~1.7 MB; ⛔ do not copy this to
+    # the def dump, where it would be a 646 MB read per question.
+    digest = _hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            digest.update(chunk)
+    fingerprint = digest.hexdigest()[:16]
+
     with open(path, newline="", encoding="utf-8") as fh:
         rd = _csv.DictReader(fh)
         if col and col not in (rd.fieldnames or []):
@@ -277,7 +291,21 @@ def cmd_csv(args) -> int:
     return emit(Measured(
         value=n, instrument="measure.csv", artifact=f"{os.path.basename(path)}"
         + (f" {col}={val}" if col else " rows"),
-        against=f"{total} data rows, header excluded"))
+        against=f"{total} data rows, header excluded; sha256:{fingerprint}"))
+
+
+def cmd_count_errors(args) -> int:
+    """How many DISTINCT errors, not how many stack-trace lines.
+
+    The one rule `artifacts.py` has always STATED about Player.log and never had
+    an instrument behind it: a grep -c counts LINES, and one error spanning 30
+    lines is not 30 errors.
+    """
+    m = playerlog.count_errors(args.path, top=args.top)
+    rc = emit(m)
+    for line, n in getattr(m, "top", []):
+        print("    %6d  %s" % (n, line))
+    return rc
 
 
 def cmd_explain(args) -> int:
@@ -373,6 +401,13 @@ def main(argv=None) -> int:
     p.add_argument("path")
     p.add_argument("--where", help="col=value")
     p.set_defaults(fn=cmd_csv)
+
+    p = _rows(sub.add_parser("count-errors",
+                             help="how many DISTINCT errors in a Player.log"))
+    p.add_argument("path")
+    p.add_argument("--top", type=int, default=0,
+                   help="also print the N commonest distinct errors")
+    p.set_defaults(fn=cmd_count_errors)
 
     p = _rows(sub.add_parser("explain", help="what is this artifact and what may read it"))
     p.add_argument("path")

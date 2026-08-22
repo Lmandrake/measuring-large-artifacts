@@ -24,6 +24,7 @@
 | `measure tag <tag> [--kind K]` | how many records carry a tag (a join, not an index) |
 | `measure flag <key> [--value V]` | how many records the producer classified this way |
 | `measure csv <path> --where col=value` | count rows without counting the header |
+| `measure count-errors <log> [--top N]` | how many DISTINCT errors in a log, not how many stack-trace lines |
 | `measure verify` | check the built form against the source, record by record |
 | `measure explain <path>` | what IS this file, and what may read it |
 | `measure sql "SELECT …"` | read-only escape hatch |

@@ -1071,6 +1071,59 @@ def t_every_registered_command_is_documented():
     assert not undocumented, "registered but undocumented: %s" % undocumented
 
 
+def t_a_log_counts_errors_not_lines():
+    """The rule `artifacts.py` has always STATED and never enforced: one error
+    spanning thirty lines is not thirty errors.
+
+    The fixture is hand-counted on purpose. Three DISTINCT faults, one of which
+    happens twice, wrapped in stack traces of three different depths -- so a
+    grep -c on any obvious pattern gives a number that is neither 3 nor 4."""
+    from measure import playerlog
+    import tempfile, os
+    d = tempfile.mkdtemp(prefix="measure_pl_")
+    p = os.path.join(d, "Player.log")
+    open(p, "w", encoding="utf-8").write(
+        "Mono path[0] = 'x'\n"
+        "RimWorld 1.6.4871 rev591\n"
+        "\n"
+        "Exception loading def from file A.xml: System.ArgumentNullException: Value cannot be null.\n"
+        "Parameter name: s\n"
+        "  at System.Single.Parse (System.String s) [0x00003] in <51fded79cd284d4d911c5949aff4cb21>:0 \n"
+        "  at Verse.ParseHelper.FromString[T] (System.String str) [0x00009] in <61e4173561894da49d>:0 \n"
+        "\n"
+        "Exception loading def from file B.xml: System.ArgumentNullException: Value cannot be null.\n"
+        "[Ref AF0EC694] Duplicate stacktrace, see ref for original\n"
+        "\n"
+        "Could not resolve cross-reference: No RimWorld.SkillDef named li found\n"
+        "\n"
+        "Config error in SignWoodenMulti: impassable, player-buildable building.\n"
+        "  - PREFIX SomeMod: Boolean Some:Thing()\n")
+    m = playerlog.count_errors(p, top=9)
+    assert m.ok, m.line()
+    # 3 distinct: the two file exceptions collapse (the filename is masked).
+    assert m.value == 3, "want 3 distinct, got %s -- %s" % (m.value, getattr(m, "top", None))
+    assert "4 occurrence" in m.evidence, m.evidence
+    # ⛔ and the fingerprint must say WHICH file the answer is about.
+    assert "sha256:" in m.against and "lines=" in m.against, m.against
+
+
+def t_a_file_that_is_not_a_log_is_refused_not_measured_zero():
+    """The exact bug this was written with: the first version keyed only on a
+    signature string, and this project's own CLAUDE.md contains both "RimWorld 1."
+    and "Ludeon Studios" in ordinary prose -- so it returned MEASURED 0. A
+    confident zero about the wrong file is the failure the whole skill exists to
+    prevent, so the wrong NAME is refused before anything is read."""
+    from measure import playerlog
+    import tempfile, os
+    d = tempfile.mkdtemp(prefix="measure_pl2_")
+    p = os.path.join(d, "notes_about_RimWorld.md")
+    open(p, "w", encoding="utf-8").write(
+        "RimWorld 1.6 notes from Ludeon Studios\nException loading def from file X.xml: boom\n")
+    m = playerlog.count_errors(p)
+    assert not m.ok, "a markdown file must not mint a measurement: " + m.line()
+    assert "REFUSED" in m.line(), m.line()
+
+
 if __name__ == "__main__":
     for k, v in sorted(globals().items()):
         if k.startswith("t_"):
