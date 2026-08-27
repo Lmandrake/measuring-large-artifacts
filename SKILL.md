@@ -181,6 +181,31 @@ whether it already handles the case and says why. And when you validate an
 instrument, **validate it against a case whose answer you already know
 independently** — not against another reading of the same artifact.
 
+### 🔴 Calibrating on the right answer is not enough — measured 2026-08-26
+
+Five instruments were built in one session, **every one calibrated against an answer
+already known**, and **every one was wrong the first time** in a way that produced a
+clean, plausible number. Not one was caught by reading its output.
+
+🔑 **The failures were never in the core logic. They were all in the cases the author
+did not think to include:**
+
+| instrument | calibrated on | broke on |
+|---|---|---|
+| a 14-check criteria grader | the shipped, correct implementation — scored 14/14 | a *regression* that kept every structure it checked and destroyed the tuned constants it did not |
+| a reply classifier | a hit, and an abstention | a **negative verdict** ("VERDICT: no, it is absent") — a right answer, counted as a find |
+| the same classifier | complete replies | a **truncated** reply, scored as "looked and found nothing" |
+| a ceiling sweep | sizes with test cases | a size with **no cases buildable**, printed `0/0` — ignorance rendered as a measurement |
+| an answer-shape prompt | prose shapes | a shape written `<1> \| <2>`, **echoed back literally** instead of filled in |
+
+⇒ **Calibrate on the known POSITIVE, the known NEGATIVE, the EMPTY case and the
+TRUNCATED case.** An instrument shown only the answer it was built to find has been
+*run*, not tested — and the case you forgot is exactly where it will answer confidently
+and wrongly. ⚠️ Note the first row especially: passing a full checklist against a
+known-good input still did not detect a real loss, because **a checklist can only see
+the dimensions it names**. Where a delegate or a generator WROTE something, the diff is
+the instrument and the checklist is not.
+
 Worked case studies of both, with the real numbers: **`references/incidents.md`**.
 
 ## Before you trust a number
@@ -195,6 +220,11 @@ expensive:
 5. **If two sources agree — are they actually independent?**
 6. **Has this instrument been checked against a known answer?** If not, it is a
    hypothesis, not a measurement.
+7. **Has it been checked against a known NEGATIVE, an EMPTY input and a TRUNCATED
+   one?** The known-good case is the one it was built to pass; the others are where
+   it answers confidently and wrongly.
+8. **Did anything WRITE?** Then read the diff. A criteria checklist reports 100%
+   while constants, weights and prose it never names are quietly destroyed.
 
 ## Project specifics
 
