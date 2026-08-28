@@ -30,6 +30,14 @@ C# logic, not an XML field) — none of which an offline scan of `Defs/` can rea
 
 ⇒ `measure count <DefType>` · `measure coverage` · `measure get <defName>`
 
+⚠️ **`measure count ThingDef` answers "how many does the DUMP hold", never "how
+many does the game RUN."** The dump is captured post-inheritance, post-patch —
+but BEFORE Cherry Picker, a mod that removes/neuters defs at runtime by
+rewriting a settings file the dump never sees. A def the owner cut is still
+fully present at dump time; only its biome `commonality` (or similar field)
+goes to 0. Two different questions, two different instruments: the dump for
+the AUTHORED set, the Jawa project's `cherrypicker.py` for WHAT SURVIVES.
+
 ## Savegames — `*.rws`
 
 Plain XML wrapping **base64 / raw-DEFLATE grids of 2-byte def shortHashes**.
