@@ -2,10 +2,16 @@
 
 Seven instruments were caught returning confident wrong numbers in a single
 session (2026-08-21). None of them errored. None warned. Every one returned a
-plausibly-shaped integer.
+plausibly-shaped integer. Cases 1–7 are those; 8 and 9 were added on 2026-08-31,
+met while optimising this package rather than while using it.
 
 These are worth reading once, not to memorise, but because **each is a different
 way for the same shape to happen**, and recognising the shape is the skill.
+
+⚠️ Note where the later ones came from. Cases 1–7 are an instrument lying about
+an artifact. Cases 8–9 are an instrument lying about **itself** — a test suite
+whose detection power was never checked, and a pair of measured improvements that
+cancelled. The shape survives the change of subject.
 
 ## 1. `strings` on a .NET assembly — 16 of 115
 
@@ -109,3 +115,60 @@ retracted and corrected in place.
 
 ⇒ Before reporting a finding against something that already exists, read whether
 it already handles the case and says why.
+
+---
+
+## Two from optimising this package — 2026-08-31
+
+Both were met while making the build faster, which is the point: neither is about
+reading a large file, and both produced numbers that looked right.
+
+### 8. A green suite that had never seen a wrong implementation
+
+42 cases passed. Every one had been written against correct code, so the suite's
+own detection power was **untested** — "42/42" established that it ran.
+
+`scripts/mutate_check.py` now breaks the code nine ways and requires a
+named-in-advance case to catch each. It found no gaps on the first run, which is
+the *only* reason the 42 mean anything.
+
+⇒ The three properties that make it an instrument rather than a ritual:
+
+- **a control run first** — a suite that was already red cannot read as detection
+- **the mutation site must match exactly once** — a mutation that silently applied
+  nowhere passes every case, which is the same shape as the shard splitter below
+- **an undetected mutation is a GAP in the suite**, reported as a finding about the
+  suite rather than as a success
+
+### 9. Two optimisations that cancelled each other, each a win alone
+
+| change | measured effect |
+|---|---|
+| windowed reader | peak memory 306 MB → **24 MB** |
+| `PRAGMA cache_size = -262144` | build time **−4%** |
+| both together | peak memory **326 MB** |
+
+256 MB of page cache gave back almost exactly what the reader had saved. Neither
+change was wrong; the pair was. Both had been measured — **separately**.
+
+Of the four pragmas the source article recommends, measured one at a time on this
+workload: `page_size` helped 7%, `locking_mode` did nothing, `temp_store` cost
+46 MB for no speed, `cache_size` cost 233 MB for 4%. Only the first shipped.
+
+⇒ **Measure the combination, on the axis you set out to improve.** Borrowed tuning
+is tuned for someone else's workload — that article was inserting 100M synthetic
+rows. And when a change exists to reduce X, the number that decides it is X with
+every other change also applied.
+
+### And one from the benchmark harness, which is the same shape as #6
+
+The shard splitter searched for `},{` and took `hit + 1` as the record start. That
+is the comma, not the record, so every candidate boundary failed validation, the
+splitter returned **one** shard instead of eight — and the shard counts matched the
+serial count *perfectly*, because there was only one shard. The harness printed a
+4.76x speedup for parallelism that had not happened.
+
+⇒ **Comparing the ANSWER cannot see that the MECHANISM never engaged.** Assert the
+mechanism too: `boundaries()` now checks it produced the shard count it was asked
+for. An xpath that matches nothing and a split that never split are the same bug
+wearing different clothes.

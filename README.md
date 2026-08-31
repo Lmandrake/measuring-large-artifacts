@@ -20,7 +20,7 @@ bench/                     where build time and memory actually go, measured
 references/
   api.md                   commands, exit codes, Python API
   building.md              how to DESIGN an artifact that cannot lose evidence
-  incidents.md             the seven wrong numbers, as case studies
+  incidents.md             the wrong numbers, as case studies
   rimworld.md              domain notes for the RimWorld modding stack
 ```
 

@@ -215,7 +215,37 @@ known-good input still did not detect a real loss, because **a checklist can onl
 the dimensions it names**. Where a delegate or a generator WROTE something, the diff is
 the instrument and the checklist is not.
 
-Worked case studies of both, with the real numbers: **`references/incidents.md`**.
+### 🔴 A green suite is a hypothesis until you break the code — measured 2026-08-31
+
+The rule above says calibrate on the negative. The next question is who calibrates
+the *calibrator*. A 42-case suite guarding this package passed, and nothing in it
+had ever been shown a wrong implementation — so "42/42" meant *the suite ran*.
+
+⇒ **Mutate the code and require the named case to notice.** Nine plausible wrong
+versions — the reader silently dropping a record, a literal search rebuilt on
+`LIKE`, an orphan's records loaded, the manifest parsed with plain `json` — each
+had to be caught by a case named in advance. `scripts/mutate_check.py`. Three
+properties make it an instrument rather than a ritual: a **control run** first, so
+a suite that was already red cannot read as detection; the mutation site must match
+**exactly once**, because a mutation that applied nowhere passes everything; and an
+undetected mutation is reported as a **gap in the suite**, not a success.
+
+### 🔴 Two optimisations, each a win, cancelling each other — measured 2026-08-31
+
+A windowed reader cut peak memory from 306 MB to 24 MB. A `cache_size` pragma from
+a "fast SQLite inserts" article cut build time 4%. Both measured, both real, both
+landed — and peak memory came out at **326 MB**, because 256 MB of page cache gave
+back almost exactly what the reader had saved. Neither change was wrong. The
+*pair* was, and each looked fine in isolation.
+
+⇒ **Measure the combination, on the axis you were trying to improve.** Borrowed
+tuning is tuned for someone else's workload: of the four pragmas that article
+recommends, one helped, one did nothing, and two cost memory for no speed. And
+when a change is meant to reduce X, the acceptance number is X after everything
+else is also applied.
+
+Worked case studies of all of these, with the real numbers:
+**`references/incidents.md`**.
 
 ## Before you trust a number
 
@@ -234,6 +264,9 @@ expensive:
    it answers confidently and wrongly.
 8. **Did anything WRITE?** Then read the diff. A criteria checklist reports 100%
    while constants, weights and prose it never names are quietly destroyed.
+9. **Has the CHECK been shown to fail?** A test suite is an instrument too, and
+   one that has only ever seen correct code has been run, not tested. Break the
+   code on purpose and require the named case to notice — see below.
 
 ## Project specifics
 
