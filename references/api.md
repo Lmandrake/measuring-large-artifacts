@@ -6,7 +6,9 @@
 - [Python API](#python-api)
 - [The Measurement types](#the-measurement-types)
 - [Querying a built artifact](#querying-a-built-artifact)
+- [`find` — the literal question, answered honestly](#find--the-literal-question-answered-honestly)
 - [Self-test](#self-test)
+- [Proving the self-test can fail](#proving-the-self-test-can-fail)
 
 ## CLI
 
@@ -20,6 +22,7 @@
 | `measure coverage --rows 20` | name them individually with reasons |
 | `measure types [LIKE]` | which types exist |
 | `measure get <name>` | does this identifier exist, and as what |
+| `measure find <literal> [--type T]` | does this exact string occur, and in how many records |
 | `measure record <name> [--type T]` | the full record, still coverage-gated |
 | `measure tag <tag> [--kind K]` | how many records carry a tag (a join, not an index) |
 | `measure flag <key> [--value V]` | how many records the producer classified this way |
@@ -120,6 +123,36 @@ than picking one — `Gun_Revolver` is a real `ThingDef`, `SymbolDef` **and**
 owns the interpretation, which is the risk the rest of the module removes. Use it
 knowingly.
 
+## `find` — the literal question, answered honestly
+
+`find(literal, def_type=None)` is the one command that exists because a
+**refusal named no instrument**. The def dump's `literal_scan_ok` is False and
+its registered instrument is `measure count <DefType>`, which answers something
+else — so "does `Gun_Revolver` appear anywhere in here" had no cheap honest
+route, and by this skill's own rule that makes the refusal an obstacle.
+
+⚠️ **It is not faster than grep and does not claim to be.** Measured ~0.1 s per
+96 MB of source against ~0.11 s for `grep -o` on the same bytes. Three things
+are what it buys:
+
+- **A zero is coverage-gated.** If any slice is shadowed, absent, failed or
+  orphaned, "no match" is `UNMEASURED` — *not found where I could look*, which
+  is a different claim from *not present*. Only a capture whose every slice is
+  complete can return `MEASURED 0`.
+- **Hits are attributed** to a record and its type, so a hit can be followed up
+  with `measure record`. A grep hit in a 331 MB single-line file cannot.
+- **It is genuinely literal.** Built on `instr`, not `LIKE`, for two measured
+  reasons: `LIKE` is case-insensitive for ASCII in SQLite, so `find gun_a` would
+  match `Gun_A`; and `%`/`_` arriving inside the caller's own string are
+  wildcards — `LIKE '%100%%'` returned **1862 rows** on the benchmark where the
+  answer was 0.
+
+🔴 **The search is over the dump's ENCODED text, not over decoded field values.**
+A producer using `ensure_ascii=True` writes `café` as `caf\u00e9`, so a naive
+search for `café` returns a confident zero about a record that plainly contains
+it. `find` searches every encoding of the literal a JSON writer might have
+produced and says in its evidence how many forms it tried.
+
 ## Self-test
 
 ```bash
@@ -136,3 +169,48 @@ The most important case asserts that a **naive parse still produces the
 misleading value**. That is what stops someone "simplifying" the careful
 duplicate-preserving parse back into the obvious one and reintroducing the
 original bug with green tests.
+
+### The hostile fixture and the differential
+
+`make_hostile_dump()` builds **one** capture carrying every failure this package
+has been burned by, simultaneously: a lossy collision, a genuinely-empty slice,
+an orphan, a BOM'd file whose name disagrees with its header, a truncated file,
+a pretty-printed file, escaped non-ASCII, and a record whose text contains
+`},{`, an escaped quote and a literal `%`.
+
+Its coverage states are **pinned by name**, so a change that accidentally makes
+the fixture healthy fails loudly instead of passing vacuously — the `0/0`
+failure from `SKILL.md`, where a sweep with no cases buildable rendered
+ignorance as a measurement.
+
+`t_both_readers_give_byte_for_byte_the_same_answers` is the gate for any
+performance change to the build: it builds the fixture with both readers and
+compares every answer — counts, coverage, types, get, record **contents**, tags,
+flags and find.
+
+⚠️ The comparison is built from **unwrapped values**, not from `.line()`.
+`Measured._render` deliberately collapses a record to `<record: 7 fields>` to keep
+a question to one line, so a surface made of rendered lines would compare two dbs
+as identical while every stored field differed.
+
+## Proving the self-test can fail
+
+```bash
+python3 <skill>/scripts/mutate_check.py
+```
+
+A suite that has only ever been shown correct code has been **run, not tested**.
+This copies `scripts/` to a temp dir, introduces one plausible wrong version of
+the code at a time — the reader silently dropping a record, `find` rebuilt on
+`LIKE`, an orphan's records loaded, the manifest parsed with plain `json` — and
+requires the named case to notice.
+
+Three properties make it an instrument rather than a ritual:
+
+- **A control run first.** If the unmutated suite is not green, nothing after it
+  can be interpreted, and it says so and stops.
+- **The mutation site must match exactly once.** A mutation that silently applied
+  nowhere would "pass" every case and read as a gap in the suite — the same shape
+  as a shard split that never happened reporting a speedup.
+- **An undetected mutation is reported as a GAP**, which is a finding about the
+  suite, not about the mutation.

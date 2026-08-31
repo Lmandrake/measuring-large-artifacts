@@ -73,6 +73,7 @@ python3 ~/.claude/skills/measuring-large-artifacts/scripts/measure/cli.py count 
 measure count <Type>          # MEASURED 24904  /  UNMEASURED + why
 measure coverage              # what the artifact did NOT capture
 measure get <name>            # does this exist, and as what
+measure find <literal>        # does this exact string occur, and where
 measure explain <path>        # what IS this file, and what may read it
 measure csv <path> --where col=value
 measure build                 # (re)build the queryable form
@@ -140,7 +141,7 @@ confident liar again.
 | what exists / how many, as of a capture | the artifact |
 | what is true RIGHT NOW in a running system | the live system, never the artifact |
 | what a config or source file SAYS | read the source; a dump shows the result, not the intent |
-| does this exact literal string occur | a plain scan is fine, and often best |
+| does this exact literal string occur | a scan is fine — `measure find` adds coverage |
 | how many, of something structured | never a scan |
 
 ⚠️ **`measure` does not answer every artifact.** It has commands for the def
@@ -157,6 +158,14 @@ distinction that matters is *literal vs semantic*: "does the byte sequence
 Foos are there" is not, whenever Foos are stored as indices, compressed, encoded,
 or spread across records. When you genuinely want the literal form, say so and
 proceed — there is an escape hatch precisely so the guard rail stays credible.
+
+Two things a scan still cannot tell you, and `measure find` exists for both. A hit
+in a 331 MB single-line file **cannot be read back to a record** — you learn that
+something matched, not what. And a **miss is not an absence**: the text may be
+stored escaped (`caf\u00e9` for `café`), or compressed, or in a slice the capture
+never wrote. ⚠️ `find` is *not* faster than `grep` — measured 0.1 s against 0.11 s
+per 96 MB. What it adds is that hits carry their record, and that a zero is
+coverage-gated, so it can only say "no" about slices it actually read.
 
 ## The lesson that outranks the tooling
 

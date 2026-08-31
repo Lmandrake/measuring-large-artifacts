@@ -15,6 +15,8 @@ SKILL.md                   the skill itself — start here
 bin/measure                CLI shim
 scripts/measure/           the implementation (stdlib only; sqlite3)
 scripts/selftest_measure.py
+scripts/mutate_check.py    breaks the code 9 ways; the suite must notice
+bench/                     where build time and memory actually go, measured
 references/
   api.md                   commands, exit codes, Python API
   building.md              how to DESIGN an artifact that cannot lose evidence
@@ -34,12 +36,19 @@ Optionally put `bin/` on `PATH` so `measure …` works bare.
 ## Verify
 
 ```bash
-python3 scripts/selftest_measure.py
+python3 scripts/selftest_measure.py     # 48 cases
+python3 scripts/mutate_check.py         # does the suite actually fail when it should?
 ```
 
 Synthetic cases run anywhere with no real capture present; live cases run against
 a real built artifact if one exists and **skip with a stated reason** if not — a
 skip is never reported as a pass.
+
+The second command is the one that makes the first mean anything. A suite that has
+only ever been shown correct code has been *run*, not tested — so `mutate_check`
+introduces nine plausible wrong versions of the code and requires the named case
+to catch each. It runs a control first, and reports an undetected mutation as a
+**gap in the suite** rather than a success.
 
 ## Design in one line
 

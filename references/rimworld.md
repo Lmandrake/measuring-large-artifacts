@@ -28,7 +28,16 @@ What it uniquely can: post-patch values, the mod that actually won an override,
 true `shortHash`es, and the engine's own computed classification (`IsWeapon` is
 C# logic, not an XML field) — none of which an offline scan of `Defs/` can reach.
 
-⇒ `measure count <DefType>` · `measure coverage` · `measure get <defName>`
+⇒ `measure count <DefType>` · `measure coverage` · `measure get <defName>` ·
+`measure find <literal>`
+
+**`find` is the one for "is this string in here anywhere"**, which is what a
+`grep` of the dump is usually reaching for. It is not faster than `grep` — the
+point is that a hit comes back attached to a record, and that a **zero refuses
+unless every slice of the capture is complete**, so "not found" cannot quietly
+mean "not looked at". ⚠️ It searches the dump's *encoded* text: the dumper writes
+non-ASCII escaped, so `café` is stored `caf\u00e9` and only a search that tries
+both forms finds it. `find` does; a hand-rolled `LIKE` does not.
 
 ⚠️ **`measure count ThingDef` answers "how many does the DUMP hold", never "how
 many does the game RUN."** The dump is captured post-inheritance, post-patch —

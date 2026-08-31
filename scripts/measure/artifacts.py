@@ -58,7 +58,15 @@ REGISTRY = (
             "a grep hit is a fragment of a record, never a record, and the "
             "line count is always 1"
         ),
-        instrument="measure count <DefType>",
+        # ⭐ TWO instruments, because there are two questions and naming only
+        # the first is what made this refusal a dead end. `count` answers "how
+        # many of this type"; `find` answers "does this exact string occur" —
+        # the question people actually reach for grep to ask. Until 2026-08-31
+        # this entry named only `count`, so the honest answer to the commoner
+        # question was "refused, and no, I will not tell you what to use
+        # instead". A refusal without a cheap alternative is an obstacle.
+        instrument=("measure count <DefType> for a census; "
+                    "measure find <literal> for whether a string occurs"),
         literal_scan_ok=False,
         ours=True,
         incident=(

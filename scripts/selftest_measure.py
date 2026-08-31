@@ -156,11 +156,17 @@ def synthetic_db():
 #:   `},{`   the exact byte sequence a shard splitter looks for (bench/par_bench)
 #:   `\"`    an escaped quote, which a brace counter must not treat as a close
 #:   `{`     an unbalanced open brace inside a string
-#:   `%`/`_` SQL LIKE wildcards, which a literal search must not honour
-#:   é / 日  non-ASCII, which widens the decoded str and desynchronises any
-#:           index that confuses characters with bytes
-_TRAP = ('a trap: },{ and \\" and a lone { and 100% and snake_case '
-         'and café and 日本語')
+#:   é / 日  non-ASCII, which widens the decoded str, and which `json.dump`
+#:           writes as `café` — so a literal search over the STORED TEXT
+#:           finds nothing unless it looks for the escaped form too
+_TRAP = 'a trap: },{ and \\" and a lone { and café and 日本語'
+
+#: ⭐ On exactly ONE record, which is the whole point. `%` and `_` are SQL LIKE
+#: wildcards, so a search built on LIKE matches far more than this — measured on
+#: the 96.5 MB benchmark, `LIKE '%100%%'` returned **1862 rows** where the honest
+#: answer was 0. Putting the marker on one record makes that leak show up as an
+#: inflated COUNT rather than as a plausible one.
+_LIKE_TRAP = "50%_off"
 
 
 def make_hostile_dump(tmp):
@@ -189,7 +195,8 @@ def make_hostile_dump(tmp):
 
     write("ThingDef.json", "ThingDef", [
         rec("Gun_A", "ThingDef", "Verse.ThingDef", 0,
-            fields={"weaponTags": ["Gun", "SimpleGun"], "tradeTags": ["Weapon"]},
+            fields={"weaponTags": ["Gun", "SimpleGun"], "tradeTags": ["Weapon"],
+                    "marker": _LIKE_TRAP},
             **{"is": {"weapon": True, "apparel": False}}),
         rec("Gun_B", "ThingDef", "Verse.ThingDef", 1,
             fields={"weaponTags": ["Gun"]},
@@ -291,8 +298,8 @@ def answer_surface(db):
     put("flag nosuch=true", db.flag("nosuch"))
 
     if hasattr(db, "find"):
-        for lit in ("Gun", "},{", '\\"', "100%", "snake_case", "café",
-                    "日本語", "GhostFromARemovedMod", "NeverAnywhere"):
+        for lit in ("Gun", "},{", '\\"', _LIKE_TRAP, "café", "日本語",
+                    "GhostFromARemovedMod", "NeverAnywhere", ""):
             put("find %r" % lit, db.find(lit))
     return out
 
@@ -335,8 +342,18 @@ def t_the_hostile_fixture_really_is_hostile():
         rec = db.record("Gun_A").unwrap()
         assert "},{" in rec["description"], "the boundary trap is missing"
         assert '\\"' in json.dumps(rec["description"]), "the quote trap is missing"
-        assert "100%" in rec["description"], "the LIKE wildcard trap is missing"
         assert "café" in rec["description"], "the non-ASCII trap is missing"
+        assert rec["fields"]["marker"] == _LIKE_TRAP, "the LIKE trap is missing"
+        # ⚠️ And the non-ASCII really is ESCAPED on disk, which is what makes a
+        # literal search over stored text hard. `json.dump` defaults to
+        # ensure_ascii=True, so the bytes say `café` even though the parsed
+        # record says `café`. A `find` that only searched the raw form would
+        # return a confident zero here.
+        raw = open(os.path.join(tmp, "defs", "ThingDef.json"),
+                   encoding="utf-8").read()
+        assert "caf\\u00e9" in raw, "the fixture is not storing escaped non-ASCII"
+        assert "café" not in raw, "the fixture stores raw non-ASCII, so the "\
+                                  "escaped-form search is untested"
     finally:
         db.close(); shutil.rmtree(tmp, ignore_errors=True)
 
@@ -413,6 +430,139 @@ def t_a_stored_record_is_what_the_producer_WROTE():
             "the stored text for S1 has no newline, so it was re-serialised "
             "rather than taken from the source: %r" % blob[:80])
         assert json.loads(blob)["defName"] == "S1"
+    finally:
+        db.close(); shutil.rmtree(tmp, ignore_errors=True)
+
+
+def t_find_is_a_literal_search_not_a_LIKE_PATTERN():
+    """🔴 The reason `find` is built on `instr` and not on `LIKE`.
+
+    `%` and `_` are LIKE wildcards, and they arrive inside the CALLER'S OWN
+    STRING. Measured on the 96.5 MB benchmark, `LIKE '%100%%'` returned **1862
+    rows** where the honest answer was 0 — no error, no warning, a plausible
+    integer. The fixture carries `50%_off` on exactly ONE record, so a wildcard
+    leak shows up as an inflated count rather than a believable one.
+    """
+    tmp, db = _hostile(WINDOW)
+    try:
+        m = db.find(_LIKE_TRAP)
+        assert m.ok, m.line()
+        assert m.unwrap() == 1, (
+            "%r matched %d records, expected exactly 1 — the wildcards in the "
+            "search string were honoured as pattern syntax: %s"
+            % (_LIKE_TRAP, m.unwrap(), m.line()))
+        # a pattern that WOULD match everything under LIKE must match nothing
+        wild = db.find("%")
+        assert not wild.ok or wild.unwrap() <= 1, (
+            "a bare %% behaved as a wildcard: %s" % wild.line())
+    finally:
+        db.close(); shutil.rmtree(tmp, ignore_errors=True)
+
+
+def t_find_is_case_sensitive_because_grep_is():
+    """LIKE is case-insensitive for ASCII in SQLite, so a LIKE-based find would
+    answer `gun_a` with `Gun_A` — a literal search that is not literal. Anyone
+    comparing it against grep would get a different number and trust the wrong
+    one."""
+    tmp, db = _hostile(WINDOW)
+    try:
+        hit = db.find("Gun_A")
+        assert hit.ok and hit.unwrap() >= 1, hit.line()
+        low = db.find("gun_a")
+        assert not (low.ok and low.unwrap() > 0), (
+            "a lowercased search matched the capitalised name: %s" % low.line())
+    finally:
+        db.close(); shutil.rmtree(tmp, ignore_errors=True)
+
+
+def t_find_searches_the_ESCAPED_form_of_a_literal_too():
+    """🔴 The confident zero this command would otherwise produce.
+
+    The search runs over the dump's stored TEXT, and `json.dump` defaults to
+    `ensure_ascii=True` — so a record whose label is `café` is stored as
+    `caf\\u00e9`. A search for `café` over that text finds nothing, while
+    `measure record` shows the word plainly. The fixture asserts the escaping is
+    real, so this is not a hypothetical.
+    """
+    tmp, db = _hostile(WINDOW)
+    try:
+        for lit in ("café", "日本語"):
+            m = db.find(lit)
+            assert m.ok and m.unwrap() >= 1, (
+                "%r was not found although records contain it — only the raw "
+                "form was searched: %s" % (lit, m.line()))
+            assert "forms searched" in m.evidence, m.evidence
+        # ⚠️ and the type list must admit when it is truncated. `café` is in
+        # four types here; an evidence line naming three of them and stopping
+        # presents a partial list as a complete one.
+        m = db.find("café")
+        assert m.unwrap() == 7, m.line()
+        assert "more type(s)" in m.evidence, (
+            "the type list was truncated without saying so: %s" % m.evidence)
+    finally:
+        db.close(); shutil.rmtree(tmp, ignore_errors=True)
+
+
+def t_find_zero_is_UNMEASURED_unless_every_slice_was_searchable():
+    """⭐ The property that makes this an instrument rather than a grep wrapper.
+
+    `get()` already says in its remedy that "absence is only as good as
+    coverage" — advice, which nobody reads at the moment they need it. `find`
+    enforces it: over a capture with a shadowed, failed and orphaned slice, a
+    string that is genuinely nowhere returns UNMEASURED. Over a capture where
+    every slice is complete, the same question returns MEASURED 0.
+
+    Both halves are required. Without the second, the command could never say
+    "no" and would be useless; without the first, it says "no" about slices it
+    never read.
+    """
+    tmp, db = _hostile(WINDOW)
+    try:
+        m = db.find("NeverAnywhereInThisCapture")
+        assert not m.ok, (
+            "a capture with unsearchable slices reported a measured absence: %s"
+            % m.line())
+        assert "not present" in m.line(), m.line()
+        assert "coverage" in m.line(), "the refusal must name the way out: %s" % m.line()
+    finally:
+        db.close(); shutil.rmtree(tmp, ignore_errors=True)
+
+    tmp, db = _fixed()          # every slice complete
+    try:
+        m = db.find("NeverAnywhereInThisCapture")
+        assert m.ok, (
+            "a fully complete capture must be able to measure an absence: %s"
+            % m.line())
+        assert m.unwrap() == 0
+        assert "measured absence" in m.evidence, m.evidence
+    finally:
+        db.close(); shutil.rmtree(tmp, ignore_errors=True)
+
+
+def t_find_never_reports_a_hit_inside_an_orphan():
+    """An orphan's records are not in `defs` at all, so a hit is impossible —
+    but the answer must not therefore be a confident zero either. The defName of
+    a def from a REMOVED mod is exactly the string someone would search for to
+    check whether it is gone, and "measured zero" would tell them yes when the
+    capture never looked."""
+    tmp, db = _hostile(WINDOW)
+    try:
+        m = db.find("GhostFromARemovedMod")
+        assert not (m.ok and m.unwrap() > 0), (
+            "an orphan's record was searchable: %s" % m.line())
+        assert not m.ok, (
+            "a removed mod's defName reported a measured absence, which reads "
+            "as 'confirmed gone': %s" % m.line())
+    finally:
+        db.close(); shutil.rmtree(tmp, ignore_errors=True)
+
+
+def t_an_empty_search_is_refused_not_answered_with_the_capture_size():
+    tmp, db = _hostile(WINDOW)
+    try:
+        m = db.find("")
+        assert not m.ok, m.line()
+        assert "REFUSED" in m.line(), m.line()
     finally:
         db.close(); shutil.rmtree(tmp, ignore_errors=True)
 

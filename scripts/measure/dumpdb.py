@@ -1186,6 +1186,139 @@ class DumpDB:
             evidence=f"of {known} defs carrying the flag",
         )
 
+    #: Coverage states whose records this capture can actually vouch for. The
+    #: same pair `record()` uses, and for the same reason: handing back a hit
+    #: implies "and this is the whole story".
+    _VOUCHABLE = (COVERAGE_COMPLETE, COVERAGE_AMBIGUOUS)
+
+    def find(self, literal: str, def_type: str = None):
+        """Does this exact string occur in the dump, and in how many records?
+
+        🔑 WHY THIS EXISTS. The def dump was the one registered artifact whose
+        refusal named no instrument for the question people actually ask. Its
+        `literal_scan_ok` is False and its named instrument is
+        `measure count <DefType>`, which answers a different question — so
+        "does `Gun_Revolver` appear anywhere in here" had no cheap honest route,
+        and by this skill's own rule a dead-end refusal is an obstacle that gets
+        routed around.
+
+        ⚠️ THIS IS NOT FASTER THAN GREP AND DOES NOT CLAIM TO BE. It is a full
+        scan of the stored records — measured ~0.1 s per 96 MB of source, against
+        ~0.11 s for `grep -o` on the same bytes. What it buys is that a hit comes
+        back attributed to a record, and that a **zero is coverage-gated**: if any
+        slice of this capture is shadowed, absent, failed or orphaned, then
+        "no match" is UNMEASURED, because absence was never established. `get()`
+        only advises that in its remedy text; this enforces it.
+
+        🔴 THE SEARCH IS OVER THE DUMP'S ENCODED TEXT, NOT OVER DECODED FIELD
+        VALUES, and that is where the confident zero lives. A producer using
+        `ensure_ascii=True` writes `café` as `caf\\u00e9`, so a search for
+        `café` finds nothing while the record plainly contains it. So every
+        encoding of the literal that a JSON writer might have produced is
+        searched, and the evidence says how many forms were tried.
+        """
+        stale = self._guard("find %r" % literal)
+        if stale:
+            return stale
+        if not literal:
+            return Refused(
+                reason="an empty search string occurs in every record, so a "
+                       "count of it measures the capture's size and nothing "
+                       "about the question",
+                artifact="find", instrument="dumpdb.find",
+                right_instrument="`measure coverage` for the size of the capture")
+
+        # ⛔ NOT `LIKE`. Two measured reasons, both of which produce a plausible
+        # wrong number rather than an error:
+        #   * LIKE is case-INSENSITIVE for ASCII in SQLite, so `find gun_a`
+        #     would match `Gun_A` — a literal search that is not literal.
+        #   * `%` and `_` in the CALLER'S OWN STRING are wildcards. Measured on
+        #     the 96.5 MB benchmark, `LIKE '%100%%'` returned 1862 rows where
+        #     the honest answer was 0.
+        # `instr` is case-sensitive, has no metacharacters, and costs the same.
+        forms = []
+        for f in (literal,
+                  json.dumps(literal, ensure_ascii=False)[1:-1],
+                  json.dumps(literal, ensure_ascii=True)[1:-1]):
+            if f and f not in forms:
+                forms.append(f)
+
+        q = ("SELECT def_type, full_name, def_name FROM defs WHERE (%s)"
+             % " OR ".join("instr(json, ?) > 0" for _ in forms))
+        args = list(forms)
+        if def_type:
+            q += " AND (def_type = ? OR full_name = ?)"
+            args += [def_type, def_type]
+        rows = self.con.execute(q, args).fetchall()
+
+        # ⚠️ Coverage cannot be joined on `def_type`: a RESOLVED collision puts
+        # two capture rows under one simple name, so the join would double every
+        # hit. Attribute by full name first, fall back to the simple name only
+        # when it names exactly one slice, and treat anything else as
+        # unattributable — which is a refusal to vouch, not a pass.
+        cov_rows = self.con.execute(
+            "SELECT def_type, full_name, coverage FROM capture").fetchall()
+        by_full = {f: c for _t, f, c in cov_rows if f}
+        by_type = {}
+        for t, _f, c in cov_rows:
+            by_type.setdefault(t, set()).add(c)
+
+        def _cov(dtype, full):
+            if full and full in by_full:
+                return by_full[full]
+            states = by_type.get(dtype) or set()
+            return next(iter(states)) if len(states) == 1 else None
+
+        solid = [r for r in rows if _cov(r[0], r[1]) in self._VOUCHABLE]
+        murky = len(rows) - len(solid)
+        blind = self.con.execute(
+            "SELECT COUNT(*) FROM capture WHERE coverage NOT IN (?,?)",
+            self._VOUCHABLE).fetchone()[0]
+
+        # ⚠️ SAY WHEN THE LIST IS TRUNCATED. The first cut printed the first
+        # three types and stopped, so `find 'café'` read "MEASURED 7 (in
+        # BetaDef, PrettyDef, SpacedDef)" — four types' worth of hits presented
+        # as three types' worth. A one-line answer has to elide, but eliding
+        # silently is how a partial list gets quoted as a complete one.
+        kinds = sorted({r[0] for r in solid})
+        where = ", ".join(kinds[:3])
+        if len(kinds) > 3:
+            where += " and %d more type(s)" % (len(kinds) - 3)
+        ev = "in %s" % where if where else ""
+        if len(forms) > 1:
+            ev += ("; " if ev else "") + "%d encoded forms searched" % len(forms)
+        if murky:
+            ev += "; %d further hit(s) in slices this capture cannot vouch for" % murky
+
+        if not solid:
+            if blind:
+                return Unmeasured(
+                    reason=f"no record this capture can vouch for contains "
+                           f"{literal!r}, but {blind} slice(s) are shadowed, "
+                           f"absent, failed or orphaned — so this is 'not found "
+                           f"where I could look', not 'not present'"
+                           + (f" ({murky} hit(s) fell in those slices)" if murky
+                              else ""),
+                    artifact="find %r" % literal,
+                    instrument="dumpdb.find",
+                    remedy="`measure coverage --rows 20` names the slices that "
+                           "cannot be searched; re-capture to close them",
+                )
+            return Measured(
+                value=0, instrument="dumpdb.find",
+                artifact="find %r" % literal, against=self.against,
+                evidence="every slice in this capture is complete, so this is a "
+                         "measured absence"
+                         + ("; %d encoded forms searched" % len(forms)
+                            if len(forms) > 1 else ""),
+            )
+        m = Measured(
+            value=len(solid), instrument="dumpdb.find",
+            artifact="find %r" % literal, against=self.against, evidence=ev,
+        )
+        m.hits = solid                     # type: ignore[attr-defined]
+        return m
+
     def record(self, def_name: str, def_type: str = None):
         """The full record for one name, as a Measurement carrying the dict.
 

@@ -79,6 +79,29 @@ MUTATIONS = [
         "an_orphan_def_type_is_refused_and_its_defs_never_load",
     ),
     (
+        "find is built on LIKE, so the caller's own % is a wildcard",
+        "measure/dumpdb.py",
+        '"instr(json, ?) > 0" for _ in forms',
+        '"json LIKE \'%\'||?||\'%\'" for _ in forms',
+        "find_is_a_literal_search_not_a_LIKE_PATTERN",
+    ),
+    (
+        "find's zero is no longer gated on coverage",
+        "measure/dumpdb.py",
+        "        if not solid:\n            if blind:",
+        "        if not solid:\n            if False:",
+        "find_zero_is_UNMEASURED_unless_every_slice_was_searchable",
+    ),
+    (
+        "find searches only the raw literal, not its escaped forms",
+        "measure/dumpdb.py",
+        "        for f in (literal,\n"
+        "                  json.dumps(literal, ensure_ascii=False)[1:-1],\n"
+        "                  json.dumps(literal, ensure_ascii=True)[1:-1]):",
+        "        for f in (literal,):",
+        "find_searches_the_ESCAPED_form_of_a_literal_too",
+    ),
+    (
         "the manifest is parsed with plain json, losing the duplicate keys",
         "measure/dumpdb.py",
         "        manifest = json.loads(fh.read(), object_pairs_hook=_pairs_hook)",

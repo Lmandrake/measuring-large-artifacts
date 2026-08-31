@@ -182,6 +182,26 @@ def cmd_flag(args) -> int:
     return emit(db.flag(args.key, value=args.value))
 
 
+def cmd_find(args) -> int:
+    """Does this exact string occur in the dump — the question grep was for.
+
+    The def dump is the one artifact `artifacts.py` refuses a scan of while
+    naming an instrument that answers something else. This closes that, and it
+    is deliberately NOT sold as faster than grep: what it adds is that hits come
+    back attributed to records, and that a zero refuses unless every slice of the
+    capture is complete.
+    """
+    db = _db(args)
+    m = db.find(args.literal, def_type=args.type)
+    if m.ok and args.rows:
+        for dtype, _full, name in getattr(m, "hits", [])[: args.rows]:
+            print("    %-30s %s" % (name, dtype))
+        extra = len(getattr(m, "hits", [])) - args.rows
+        if extra > 0:
+            print("    ... %d more (use --rows)" % extra)
+    return emit(m)
+
+
 def cmd_record(args) -> int:
     db = _db(args)
     m = db.record(args.def_name, def_type=args.type)
@@ -391,6 +411,11 @@ def main(argv=None) -> int:
     p.add_argument("key")
     p.add_argument("--value", default="true")
     p.set_defaults(fn=cmd_flag)
+
+    p = _rows(sub.add_parser("find", help="does this exact string occur, and in how many records"))
+    p.add_argument("literal")
+    p.add_argument("--type", help="only search one def type")
+    p.set_defaults(fn=cmd_find)
 
     p = _rows(sub.add_parser("record", help="the full record for one name"))
     p.add_argument("def_name")
