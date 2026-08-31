@@ -18,6 +18,41 @@ python3 bench/sql_bench.py big.json
 python3 bench/par_bench.py big.json
 ```
 
+## End to end, the shipped path — landed 2026-08-31
+
+`build()` on a synthetic dump holding one big `defs/ThingDef.json`, before and
+after the reader + index changes. Same 112,000 / 280,000 defs, and the selftest's
+differential case asserts every answer is identical.
+
+| source file | before | after |
+|---|---|---|
+| 96.5 MB | 2.72 s / **720 MB** peak | 1.77 s / **50 MB** peak |
+| 241.5 MB | 6.90 s / **1248 MB** peak | 4.61 s / **49 MB** peak |
+
+⭐ **The headline is the second column, not the first.** 1.5x on time is worth
+having; peak memory ceasing to scale with file size at all is a different kind of
+change. The old path wanted an extrapolated 1.7–2.5 GB to answer `count ThingDef`
+against the real 331 MB file. The new one wants ~50 MB whatever the file is, and
+that was verified by growing the file 2.5x and watching the peak not move.
+
+### The pragma that cancelled the other optimisation
+
+Measured one at a time on the 96.5 MB file, best of two runs:
+
+| build pragma | time | peak |
+|---|---|---|
+| none | 1.92 s | 48 MB |
+| `page_size = 8192` | **1.78 s** | 49 MB |
+| `temp_store = MEMORY` | 1.94 s | 94 MB |
+| `locking_mode = EXCLUSIVE` | 1.93 s | 48 MB |
+| `cache_size = -262144` | 1.78 s | **326 MB** |
+
+Only `page_size` survived. 🔴 `cache_size` is the one worth remembering: 256 MB of
+page cache bought **4% of build time and gave back, almost exactly, the memory the
+windowed reader had just saved.** Two performance changes, each a win in isolation,
+one silently cancelling the other. The advice it came from is real advice — it is
+just tuned for inserting 100M synthetic rows, which is not this workload.
+
 ## Reading the file — `read_bench.py`
 
 | variant | what it does | time | peak RSS |

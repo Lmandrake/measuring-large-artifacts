@@ -122,6 +122,23 @@ CREATE TABLE def_tags (
 );
 
 CREATE INDEX idx_capture_ty ON capture(def_type);
+"""
+
+#: 🔑 Created AFTER the bulk load, not with the tables. Every row inserted while
+#: an index exists pays to maintain its B-tree; measured 2026-08-31 on the 96.5 MB
+#: benchmark, the insert phase went 1.97s -> 1.21s and rebuilding all eight
+#: indexes afterwards cost 0.54s, for ~18% off the total.
+#:
+#: ⚠️ `idx_capture_ty` is deliberately NOT in here. `capture` has one row per def
+#: TYPE — hundreds, not hundreds of thousands — so it costs nothing to maintain,
+#: and `build`'s own repair paths query it while the load is still running.
+#:
+#: ⚠️ What this trades away: the `shadowed` and `failed` branches below run
+#: `DELETE FROM defs WHERE def_type = ?` DURING the load, and without
+#: `idx_defs_type` that is a full table scan. It is a rare path — 13 collisions
+#: on the real dump — and correctness there does not depend on speed, but a
+#: capture that is mostly damaged will build slower than it used to.
+INDEXES = """
 CREATE INDEX idx_defs_name  ON defs(def_name);
 CREATE INDEX idx_defs_type  ON defs(def_type);
 CREATE INDEX idx_defs_conc  ON defs(concrete_type);
@@ -130,6 +147,30 @@ CREATE INDEX idx_flags      ON def_flags(key, value);
 CREATE INDEX idx_flags_def  ON def_flags(def_id);
 CREATE INDEX idx_tags       ON def_tags(kind, tag);
 CREATE INDEX idx_tags_def   ON def_tags(def_id);
+"""
+
+#: Set before the first table exists, because `page_size` cannot be changed
+#: afterwards without a VACUUM. Larger pages mean fewer overflow chains for the
+#: `json` column, which is the biggest thing in the file.
+#:
+#: 🔴 THIS LIST IS SHORT BECAUSE IT WAS MEASURED, AND IT SHOULD STAY SHORT.
+#: The first cut of it carried the four pragmas every "fast SQLite insert"
+#: article recommends. Measured 2026-08-31 on the 96.5 MB benchmark, one at a
+#: time, best of two runs:
+#:
+#:     none                  1.92s   48 MB peak
+#:     page_size=8192        1.78s   49 MB      <- kept
+#:     temp_store=MEMORY     1.94s   94 MB      <- slower AND +46 MB
+#:     locking_mode=EXCL     1.93s   48 MB      <- no effect, real risk
+#:     cache_size=-262144    1.78s  326 MB      <- 4% for 233 MB
+#:
+#: ⚠️ `cache_size` is the one to remember. 256 MB of page cache bought 4% of
+#: build time and gave back, exactly, the memory the windowed reader had just
+#: saved — a performance change that quietly cancelled the other performance
+#: change, with both looking like wins in isolation. Advice tuned for inserting
+#: 100M synthetic rows is not advice about this workload.
+BUILD_PRAGMAS = """
+PRAGMA page_size = 8192;
 """
 
 #: Which list-valued fields become def_tags rows. Keyed by the field name as it
@@ -226,36 +267,79 @@ def collision_report(declared_order):
 # streaming read
 # --------------------------------------------------------------------------
 
-def iter_defs(path):
-    """Yield each def object from a defs/<Type>.json without loading the graph.
+#: How much of a defs file is held in memory at once, in CHARACTERS.
+#:
+#: 🔑 Measured 2026-08-31 (`bench/read_bench.py`, 96.5 MB synthetic file): the
+#: old whole-file read peaked at **306 MB of RSS for a 96 MB file** — ~3.2x —
+#: because at peak the raw bytes and the decoded `str` are both live, and one
+#: non-ASCII character in one label widens the whole `str` to 2 bytes per
+#: character. Extrapolated to the real 331 MB `defs/ThingDef.json` that is about
+#: **1.05 GB of RAM to answer `count ThingDef`**.
+#: A sliding window is the same speed, and the size of the window IS the memory:
+#: 17 MB @ 16 KiB, **24 MB @ 256 KiB**, 219 MB @ 4 MiB. The jump at 4 MiB is
+#: superlinear and unexplained, which is its own argument for staying small.
+WINDOW = 1 << 18
 
-    Also yields the file's own header/trailer facts, which are what let us tell
-    a shadowed file from an honest one: the `defType` INSIDE the file is
-    authoritative, the filename is not.
+_DEFS_ARRAY = re.compile(r'"defs"\s*:\s*\[')
 
-    Returns (header, generator). header holds defType and count.
+
+def _file_count(path):
+    """The `count` the file declares after its array closes, or None.
+
+    Read from the last 200 BYTES rather than from the decoded text, so it costs
+    the same whichever reader is walking the records. The tail is
+    `],"count":123}` — pure ASCII in every dump this has seen — but it is decoded
+    with `replace` because a multi-byte character cut in half by the 200-byte
+    boundary must not raise; it must simply not match.
+    """
+    with open(path, "rb") as fh:
+        try:
+            fh.seek(-200, os.SEEK_END)
+        except OSError:                      # a file shorter than 200 bytes
+            fh.seek(0)
+        tail = fh.read().decode("utf-8", "replace")
+    ct = tail.rfind('"count":')
+    if ct < 0:
+        return None
+    try:
+        return int(tail[ct + 8:].strip().rstrip("}").strip().rstrip(","))
+    except ValueError:
+        return None
+
+
+def _read_header(fh, path, window):
+    """-> (header, the text already read that follows `"defs":[`).
+
+    Shared by both readers on purpose. The header carries the only authoritative
+    statement of what type a file holds, so the two readers must not be able to
+    disagree about it — if this logic were duplicated, the differential case in
+    the selftest would be comparing two copies of it rather than the walking it
+    is meant to compare.
     """
     # utf-8-sig, not utf-8: a BOM makes the header parse fail, and the old
     # fallback then trusted the FILENAME over the file's own defType — which
     # this module states outright is not authoritative. A BOM'd file invented a
     # def type that never existed. Found by red team 2026-08-21.
-    with open(path, "r", encoding="utf-8-sig") as fh:
-        text = fh.read()
-
-    dec = json.JSONDecoder()
-
-    # The header keys precede "defs". Decode just enough to read defType,
-    # rather than the whole object.
+    buf = fh.read(window)
     # Tolerate whitespace around the colon and bracket. The shipped dumper
     # writes compact JSON, but a hand-written or reformatted dump is still a
     # valid dump, and a reader that only accepts one spelling is brittle in a
     # way that reads as "the file is corrupt".
-    mm = re.search(r'"defs"\s*:\s*\[', text)
-    if mm is None:
-        raise ValueError(f"{os.path.basename(path)} has no defs array")
-    at, end = mm.start(), mm.end()
+    #
+    # ⚠️ GROW rather than assume the header fits the window. A pretty-printed
+    # dump, or a window someone lowered to bound memory further, can push
+    # `"defs":[` past the first chunk — and a reader that then said "has no defs
+    # array" would report a healthy file as damaged.
+    while True:
+        mm = _DEFS_ARRAY.search(buf)
+        if mm is not None:
+            break
+        more = fh.read(window)
+        if not more:
+            raise ValueError(f"{os.path.basename(path)} has no defs array")
+        buf += more
 
-    head_text = text[: at] .rstrip()
+    head_text = buf[: mm.start()].rstrip()
     if head_text.endswith(","):
         head_text = head_text[:-1]
     try:
@@ -267,28 +351,119 @@ def iter_defs(path):
             f"{os.path.basename(path)}: header is unreadable ({ex}), so the "
             f"authoritative defType is unknown. The filename is NOT a "
             f"substitute for it.")
+    return header, buf[mm.end():]
 
-    # The trailing "count" is after the array closes.
-    tail = text[-200:]
-    file_count = None
-    ct = tail.rfind('"count":')
-    if ct >= 0:
-        try:
-            file_count = int(tail[ct + 8:].strip().rstrip("}").strip().rstrip(","))
-        except ValueError:
-            file_count = None
-    header["fileCount"] = file_count
+
+def _walk(buf, fh, window):
+    """Yield (def object, its SOURCE SPAN) for each record in the array.
+
+    ⭐ The span is the second value, and it is why this is more than a memory
+    change. `raw_decode` already reports where the record ended, so the exact
+    text the producer wrote is in hand — and `build` used to throw it away and
+    call `json.dumps` on the parsed object to rebuild an equivalent string. That
+    re-serialisation was **half the entire read cost** (1.11s -> 0.53s on the
+    96.5 MB benchmark) and what it bought was a *canonicalised* record where what
+    is wanted is the producer's own.
+
+    `fh is None` means the whole array is already in `buf` — the reference
+    reader. Otherwise the buffer is refilled on demand and never exceeds
+    `window` plus one record.
+    """
+    dec = json.JSONDecoder()
+    idx = 0
+    while True:
+        # Separators first, refilling if the buffer runs out mid-gap.
+        while True:
+            while idx < len(buf) and buf[idx] in " \t\r\n,":
+                idx += 1
+            if idx < len(buf):
+                break
+            if fh is None:
+                return
+            more = fh.read(window)
+            if not more:
+                return
+            buf, idx = buf[idx:] + more, 0
+        if buf[idx] == "]":
+            return
+        # ⚠️ A record may be LARGER than the window, and a record may be cut in
+        # half by the window boundary. Both look identical to `raw_decode` — it
+        # raises — and both are answered by reading more. Only when the file is
+        # exhausted does the failure become real, and that is exactly the
+        # truncated-file case `build` is required to RECORD rather than die on.
+        while True:
+            try:
+                obj, end = dec.raw_decode(buf, idx)
+                break
+            except ValueError:
+                if fh is None:
+                    raise
+                more = fh.read(window)
+                if not more:
+                    raise
+                buf, idx = buf[idx:] + more, 0
+        yield obj, buf[idx:end]
+        idx = end
+
+
+class _StringSource:
+    """Makes an already-read `str` look like the text stream `_read_header`
+    wants, so the reference reader shares that logic instead of copying it."""
+
+    __slots__ = ("_text", "_at")
+
+    def __init__(self, text):
+        self._text, self._at = text, 0
+
+    def read(self, n):
+        out = self._text[self._at: self._at + n]
+        self._at += len(out)
+        return out
+
+
+def iter_defs(path, window=WINDOW):
+    """Yield each def from a defs/<Type>.json without loading the graph.
+
+    Also returns the file's own header/trailer facts, which are what let us tell
+    a shadowed file from an honest one: the `defType` INSIDE the file is
+    authoritative, the filename is not.
+
+    Returns (header, generator of (def_object, source_span)).
+
+    `window=None` selects the **reference reader**, which reads the whole file
+    into one `str` exactly as every version before 2026-08-31 did. It is kept,
+    and must keep working, for the same reason the selftest keeps a naive
+    manifest parse around: it is the independent second route the differential
+    case compares against. ⛔ It is not the default and should not be used to
+    answer anything — `WINDOW` records what it costs.
+    """
+    fh = open(path, "r", encoding="utf-8-sig")
+    try:
+        if window is None:
+            text = fh.read()
+            header, rest = _read_header(_StringSource(text), path, len(text) + 1)
+            gen_fh, gen_window = None, 0
+        else:
+            header, rest = _read_header(fh, path, window)
+            gen_fh, gen_window = fh, window
+        header["fileCount"] = _file_count(path)
+    except BaseException:
+        fh.close()
+        raise
 
     def gen():
-        idx = end
-        n = len(text)
-        while True:
-            while idx < n and text[idx] in " \t\r\n,":
-                idx += 1
-            if idx >= n or text[idx] == "]":
-                return
-            obj, idx = dec.raw_decode(text, idx)
-            yield obj
+        # 🔴 The handle is closed by the GENERATOR, not by a `with` around the
+        # header parse. The old reader could use `with` because it had already
+        # read the whole file before yielding anything; this one is still reading
+        # while the caller iterates, and `build` abandons the generator on a
+        # shadowed or damaged file. Without this `finally`, every abandoned file
+        # leaked a descriptor until GC — 536 files per build, and on Windows an
+        # open handle is also what makes the final `os.replace` fail.
+        try:
+            for pair in _walk(rest, gen_fh, gen_window):
+                yield pair
+        finally:
+            fh.close()
 
     return header, gen()
 
@@ -321,8 +496,15 @@ def modlist_fingerprint(mods) -> str:
     return h[:16]
 
 
-def build(dump_dir: str, db_path: str = None, only=None, progress=None) -> BuildStats:
-    """Build defs.sqlite from a DefDump directory. Never touches the JSON."""
+def build(dump_dir: str, db_path: str = None, only=None, progress=None,
+          window=WINDOW) -> BuildStats:
+    """Build defs.sqlite from a DefDump directory. Never touches the JSON.
+
+    `window` is passed straight to `iter_defs`, so `window=None` builds via the
+    reference reader. That exists for the differential case in the selftest and
+    for nothing else: two builds of one capture, one per reader, must produce
+    identical answers.
+    """
     dump_dir = os.path.abspath(dump_dir)
     if db_path is None:
         db_path = os.path.join(dump_dir, DB_NAME)
@@ -343,6 +525,7 @@ def build(dump_dir: str, db_path: str = None, only=None, progress=None) -> Build
     if os.path.exists(db_path):
         os.remove(db_path)
     con = sqlite3.connect(db_path)
+    con.executescript(BUILD_PRAGMAS)
     con.executescript(SCHEMA)
 
     mods = manifest.get("mods", [])
@@ -407,7 +590,7 @@ def build(dump_dir: str, db_path: str = None, only=None, progress=None) -> Build
             continue
         path = os.path.join(defs_dir, fname)
         try:
-            header, it = iter_defs(path)
+            header, it = iter_defs(path, window=window)
         except Exception as ex:                      # unreadable / truncated
             con.execute(
                 "INSERT OR REPLACE INTO capture VALUES (?,?,?,?,?,?,?,?,?)",
@@ -486,7 +669,7 @@ def build(dump_dir: str, db_path: str = None, only=None, progress=None) -> Build
         rows, flagrows, tagrows = [], [], []
         n = 0
         try:
-            for d in it:
+            for d, span in it:
                 did = next_id
                 next_id += 1
                 n += 1
@@ -502,7 +685,15 @@ def build(dump_dir: str, db_path: str = None, only=None, progress=None) -> Build
                     d.get("modName"),
                     d.get("packageId"),
                     d.get("shortHash"),
-                    json.dumps(d, separators=(",", ":"), ensure_ascii=False),
+                    # ⭐ The producer's own bytes, not a re-serialisation of the
+                    # parse. `json.dumps(d, …)` here was half the read cost, and
+                    # it stored a canonicalised record — key order and float
+                    # spelling as Python would write them — in a column whose
+                    # whole job is to hand back what the dump actually said.
+                    # ⚠️ Two dbs are therefore no longer byte-comparable. The
+                    # invariant that replaces that is asserted in the selftest:
+                    # `json.loads(span) == d` for every record.
+                    span,
                 ))
                 isblock = d.get("is")
                 if isinstance(isblock, dict):
@@ -589,6 +780,14 @@ def build(dump_dir: str, db_path: str = None, only=None, progress=None) -> Build
             "INSERT OR REPLACE INTO capture VALUES (?,?,?,?,?,?,?,?,?)",
             (t, t, None, None, count, None, 0, cov, reason),
         )
+
+    # 🔑 Indexes here — after every row is in, before provenance goes in. The
+    # ordering is not cosmetic: provenance is the completion marker, so a build
+    # that dies during index creation leaves a db with no provenance, which
+    # `DumpDB` already refuses as debris. Creating them after provenance instead
+    # would leave a db that answers, from unindexed tables, and calls itself
+    # complete.
+    con.executescript(INDEXES)
 
     # Written LAST on purpose: its presence is what marks the build complete,
     # and DumpDB refuses a db without it.

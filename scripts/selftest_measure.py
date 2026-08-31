@@ -28,7 +28,7 @@ sys.path.insert(0, HERE)          # this skill's scripts/ dir holds the package
 
 from measure import artifacts                                      # noqa: E402
 from measure.dumpdb import (
-    SCHEMA_VERSION,                                       # noqa: E402
+    SCHEMA_VERSION, WINDOW,                               # noqa: E402
     DumpDB, DB_NAME, build, default_dump_dir, iter_defs, split_capture_layout,
 )
 from measure.result import (                                       # noqa: E402
@@ -128,6 +128,322 @@ def synthetic_db():
     make_dump(tmp)
     build(tmp)
     return tmp, DumpDB(os.path.join(tmp, DB_NAME))
+
+
+# --------------------------------------------------------------------------
+# ONE capture holding every hostile case at once, and the differential
+# --------------------------------------------------------------------------
+# 🔑 WHY A SINGLE FIXTURE RATHER THAN THE SIX SEPARATE ONES ABOVE. The cases
+# above each build their own tiny dump and check the one thing they were written
+# for. That is the shape SKILL.md warns about: *an instrument shown only the
+# answer it was built to find has been run, not tested.* A change to the reader
+# or the schema has to be shown not to move ANY answer, and for that the hostile
+# cases must coexist — a truncated file next to a collision next to an orphan, so
+# the interactions are in scope too.
+#
+# The six properties, and what each one is here to break:
+#   collision (lossy)  the 824-def loss — must read `shadowed`, never 0
+#   empty slice        must read MEASURED 0, and stay distinguishable from above
+#   orphan             undeclared leftover; its records must never load
+#   BOM                the header, not the filename, names the type
+#   truncation         must be RECORDED, and must not abort the other files
+#   non-ASCII + traps  a record whose text carries `},{`, an escaped quote, a
+#                      literal `%` and `_` — hostile to any boundary scanner and
+#                      to any search built on LIKE
+
+#: A description engineered to break a naive reader. Every element is here for a
+#: measured reason, and none of it is decoration:
+#:   `},{`   the exact byte sequence a shard splitter looks for (bench/par_bench)
+#:   `\"`    an escaped quote, which a brace counter must not treat as a close
+#:   `{`     an unbalanced open brace inside a string
+#:   `%`/`_` SQL LIKE wildcards, which a literal search must not honour
+#:   é / 日  non-ASCII, which widens the decoded str and desynchronises any
+#:           index that confuses characters with bytes
+_TRAP = ('a trap: },{ and \\" and a lone { and 100% and snake_case '
+         'and café and 日本語')
+
+
+def make_hostile_dump(tmp):
+    """A capture carrying all six hostile properties simultaneously."""
+    defs_dir = os.path.join(tmp, "defs")
+    os.makedirs(defs_dir, exist_ok=True)
+
+    def rec(name, dtype, full, i, **extra):
+        d = {"defName": name, "defType": dtype, "defTypeFull": full,
+             "label": "lé %s" % name, "description": _TRAP,
+             "shortHash": 1000 + i, "modName": "Core",
+             "packageId": "ludeon.rimworld", "fields": {}}
+        d.update(extra)
+        return d
+
+    def write(fname, dtype, body, full=None, encoding="utf-8", pad=0):
+        obj = {"defType": dtype, "defTypeFull": full or dtype}
+        if pad:
+            # Pushes `"defs":[` past a small window, so the header-growth path
+            # in _read_header is exercised rather than merely present.
+            obj["padding"] = "p" * pad
+        obj["defs"] = body
+        obj["count"] = len(body)
+        with open(os.path.join(defs_dir, fname), "w", encoding=encoding) as fh:
+            json.dump(obj, fh, separators=(",", ":"))
+
+    write("ThingDef.json", "ThingDef", [
+        rec("Gun_A", "ThingDef", "Verse.ThingDef", 0,
+            fields={"weaponTags": ["Gun", "SimpleGun"], "tradeTags": ["Weapon"]},
+            **{"is": {"weapon": True, "apparel": False}}),
+        rec("Gun_B", "ThingDef", "Verse.ThingDef", 1,
+            fields={"weaponTags": ["Gun"]},
+            **{"is": {"weapon": True, "apparel": False}}),
+        rec("Rock", "ThingDef", "Verse.ThingDef", 2,
+            **{"is": {"weapon": False, "apparel": False}}),
+    ], full="Verse.ThingDef")
+
+    # genuinely empty — the answer is MEASURED 0
+    write("EmptyDef.json", "EmptyDef", [])
+    # the collision loser: declared three times, file left holding nothing
+    write("AbilityDef.json", "AbilityDef", [])
+    # a BOM, and a filename that disagrees with the header
+    write("Alpha.json", "BetaDef",
+          [rec("B1", "BetaDef", "Mod.BetaDef", 0)], encoding="utf-8-sig")
+    # a header too long for a small window
+    write("PrettyDef.json", "PrettyDef",
+          [rec("P%d" % i, "PrettyDef", "Mod.PrettyDef", i) for i in range(2)],
+          pad=4096)
+    # an orphan: a real file the manifest never declared
+    write("DeadModDef.json", "DeadModDef",
+          [rec("GhostFromARemovedMod", "DeadModDef", "Dead.DeadModDef", 0)])
+
+    # ⭐ PRETTY-PRINTED, and the only file here that is. A re-serialised record
+    # and a source span reparse to the same object, so no equality check can
+    # tell them apart — but they are not the same TEXT. This file is the one
+    # place the difference is visible, which makes it the only thing standing
+    # between `build` and someone reinstating `json.dumps` for tidiness.
+    obj = {"defType": "SpacedDef", "defTypeFull": "Mod.SpacedDef",
+           "defs": [rec("S1", "SpacedDef", "Mod.SpacedDef", 0)], "count": 1}
+    with open(os.path.join(defs_dir, "SpacedDef.json"), "w",
+              encoding="utf-8") as fh:
+        json.dump(obj, fh, indent=2)
+
+    # truncated — written whole, then cut mid-record
+    write("BiomeDef.json", "BiomeDef",
+          [rec("Desert", "BiomeDef", "RimWorld.BiomeDef", 0),
+           rec("Tundra", "BiomeDef", "RimWorld.BiomeDef", 1)])
+    p = os.path.join(defs_dir, "BiomeDef.json")
+    text = open(p, encoding="utf-8").read()
+    open(p, "w", encoding="utf-8").write(text[: len(text) * 2 // 3])
+
+    # ⚠️ RAW TEXT, not json.dump: the failure being reproduced IS a duplicate
+    # key, and no Python dict can hold one. 612 written first, then 18, then 0.
+    manifest_text = (
+        '{"tool":"RimDefDump","toolVersion":"1.0","mode":"all",'
+        '"capturedUtc":"2026-08-31T00:00:00Z","gameVersion":"1.6.hostile",'
+        '"modCount":2,'
+        '"mods":[{"loadOrder":1,"name":"Core","packageId":"ludeon.rimworld"},'
+        '{"loadOrder":2,"name":"Mod","packageId":"some.mod"}],'
+        '"defCounts":{"ThingDef":3,"BiomeDef":2,"EmptyDef":0,"BetaDef":1,'
+        '"PrettyDef":2,"SpacedDef":1,'
+        '"AbilityDef":612,"AbilityDef":18,"AbilityDef":0}}'
+    )
+    with open(os.path.join(tmp, "manifest.json"), "w", encoding="utf-8") as fh:
+        fh.write(manifest_text)
+    return tmp
+
+
+def answer_surface(db):
+    """Every answer this db can give, as {question: comparable}.
+
+    🔴 NOT built from `.line()` alone. `Measured._render` deliberately collapses
+    a record to `<record: 7 fields>` to keep a question to one line — so a
+    surface made of rendered lines would compare two dbs as equal while the
+    stored records differed in every field. That is the SKILL.md failure verbatim:
+    *a checklist can only see the dimensions it names.* Where a value is a
+    record, the canonical JSON of the value is compared too.
+    """
+    out = {}
+
+    def put(q, m):
+        out[q] = m.line()
+        if m.ok and isinstance(m.value, (dict, list)):
+            out[q + " !value"] = json.dumps(m.value, sort_keys=True,
+                                            separators=(",", ":"))
+
+    types = sorted({r[0] for r in db.sql("SELECT def_type FROM capture")}
+                   | {r[0] for r in db.sql("SELECT capture_key FROM capture")})
+    for t in types + ["NoSuchDef"]:
+        put("count %s" % t, db.count(t))
+    out["coverage"] = json.dumps(db.coverage_summary(), sort_keys=True)
+    out["types"] = json.dumps(db.types(), sort_keys=True, default=str)
+
+    names = [r[0] for r in db.sql("SELECT DISTINCT def_name FROM defs "
+                                  "ORDER BY def_name")]
+    for n in names + ["GhostFromARemovedMod", "NeverExisted"]:
+        put("get %s" % n, db.get(n))
+        put("record %s" % n, db.record(n))
+
+    for kind, tag in db.sql("SELECT DISTINCT kind, tag FROM def_tags "
+                            "ORDER BY kind, tag"):
+        put("tag %s/%s" % (kind, tag), db.tag(tag, kind=kind))
+    put("tag weaponTags/NeverTagged", db.tag("NeverTagged", kind="weaponTags"))
+
+    for (key,) in db.sql("SELECT DISTINCT key FROM def_flags ORDER BY key"):
+        for v in ("true", "false"):
+            put("flag %s=%s" % (key, v), db.flag(key, value=v))
+    put("flag nosuch=true", db.flag("nosuch"))
+
+    if hasattr(db, "find"):
+        for lit in ("Gun", "},{", '\\"', "100%", "snake_case", "café",
+                    "日本語", "GhostFromARemovedMod", "NeverAnywhere"):
+            put("find %r" % lit, db.find(lit))
+    return out
+
+
+def _hostile(window):
+    """Build the hostile capture with one reader. -> (tmp, db)"""
+    tmp = tempfile.mkdtemp(prefix="measure_hostile_")
+    make_hostile_dump(tmp)
+    build(tmp, window=window)
+    return tmp, DumpDB(os.path.join(tmp, DB_NAME))
+
+
+def t_the_hostile_fixture_really_is_hostile():
+    """⭐ CALIBRATE THE FIXTURE BEFORE TRUSTING THE DIFFERENTIAL.
+
+    A differential over a fixture that turned out to be six healthy files would
+    pass forever and prove nothing — the empty-sweep failure from
+    SKILL.md, where a size with no cases buildable printed `0/0` and it read as a
+    measurement. So the coverage states are pinned here by name. If a future
+    change makes one of these slices healthy, THIS fails first and says so.
+    """
+    tmp, db = _hostile(None)
+    try:
+        cov = dict(db.sql("SELECT def_type, coverage FROM capture"))
+        want = {"ThingDef": "complete", "EmptyDef": "complete",
+                "BetaDef": "complete", "PrettyDef": "complete",
+                "AbilityDef": "shadowed", "BiomeDef": "failed",
+                "DeadModDef": "orphan"}
+        for t, state in want.items():
+            assert cov.get(t) == state, (
+                "the fixture stopped being hostile: %s is %r, expected %r"
+                % (t, cov.get(t), state))
+        # the empty slice and the shadowed one must not render the same
+        assert db.count("EmptyDef").ok, db.count("EmptyDef").line()
+        assert db.count("EmptyDef").unwrap() == 0
+        assert not db.count("AbilityDef").ok
+        assert not db.count("BiomeDef").ok
+        assert not db.count("DeadModDef").ok
+        # and the traps really are in the stored text
+        rec = db.record("Gun_A").unwrap()
+        assert "},{" in rec["description"], "the boundary trap is missing"
+        assert '\\"' in json.dumps(rec["description"]), "the quote trap is missing"
+        assert "100%" in rec["description"], "the LIKE wildcard trap is missing"
+        assert "café" in rec["description"], "the non-ASCII trap is missing"
+    finally:
+        db.close(); shutil.rmtree(tmp, ignore_errors=True)
+
+
+def t_both_readers_give_byte_for_byte_the_same_answers():
+    """🔴 THE GATE FOR EVERY PERFORMANCE CHANGE TO THE BUILD.
+
+    The windowed reader is 2x faster and holds 24 MB where the reference holds
+    306 MB (bench/read_bench.py, 96.5 MB file). None of that is worth anything if
+    it moves a single answer, so every answer is compared: counts, coverage,
+    types, get, record CONTENTS, tags, flags and find — over the hostile capture,
+    where a shadowed, a truncated, an orphan and an empty slice are all in play.
+    """
+    built = []
+    try:
+        ta, a = _hostile(None)              # reference: whole file in one str
+        built.append((ta, a))
+        tb, b = _hostile(WINDOW)            # shipped: 256 KiB sliding window
+        built.append((tb, b))
+        sa, sb = answer_surface(a), answer_surface(b)
+        assert set(sa) == set(sb), (
+            "the two readers do not even answer the same questions: %s"
+            % sorted(set(sa) ^ set(sb))[:5])
+        diff = [k for k in sa if sa[k] != sb[k]]
+        # `against` carries the db filename, which differs by temp dir. Strip it
+        # rather than loosening the comparison: everything before the `@` is the
+        # answer, and it must match exactly.
+        diff = [k for k in diff
+                if sa[k].split(" @ ")[0] != sb[k].split(" @ ")[0]]
+        assert not diff, "readers disagree on %d answers, first: %s\n  ref: %s\n  win: %s" % (
+            len(diff), diff[0], sa[diff[0]], sb[diff[0]])
+        assert len(sa) > 40, (
+            "the surface only has %d questions in it, which is too few to be "
+            "evidence of anything" % len(sa))
+    finally:
+        for tmp, db in built:
+            db.close()
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+def t_a_stored_record_is_what_the_producer_WROTE():
+    """The invariant that replaces byte-comparability.
+
+    `build` now stores the producer's own source span instead of re-serialising
+    the parse, which is half the read cost saved and one guarantee changed: two
+    dbs are no longer byte-identical. What must still hold is that the stored
+    text reparses to exactly the record the dump contained — checked against an
+    INDEPENDENT walk of the json, not against the db's own idea of itself.
+    """
+    tmp, db = _hostile(WINDOW)
+    try:
+        from measure.dumpdb import iter_defs as _iter
+        path = os.path.join(tmp, "defs", "ThingDef.json")
+        _h, it = _iter(path, window=64)      # tiny window: every refill path
+        n = 0
+        for obj, span in it:
+            n += 1
+            assert json.loads(span) == obj, (
+                "the stored span does not reparse to the record: %s"
+                % obj.get("defName"))
+            got = db.record(obj["defName"])
+            assert got.ok, got.line()
+            assert got.unwrap() == obj, (
+                "the db's record for %s differs from the json's"
+                % obj["defName"])
+        assert n == 3, "walked %d records, expected 3" % n
+
+        # 🔴 THE ONLY CHECK THAT CAN SEE A REVERT TO json.dumps. Equality cannot:
+        # a re-serialised record and a source span parse to the same object. The
+        # pretty-printed file is the one place the TEXT differs, so this is what
+        # stands between `build` and someone reinstating json.dumps for tidiness.
+        blob = db.sql("SELECT json FROM defs WHERE def_name='S1'")[0][0]
+        assert "\n" in blob, (
+            "the stored text for S1 has no newline, so it was re-serialised "
+            "rather than taken from the source: %r" % blob[:80])
+        assert json.loads(blob)["defName"] == "S1"
+    finally:
+        db.close(); shutil.rmtree(tmp, ignore_errors=True)
+
+
+def t_a_window_smaller_than_one_record_still_reads_every_record():
+    """A record larger than the window, and a record cut in half by it, both
+    look like a parse error. Only exhaustion is a real one.
+
+    ⚠️ 64 characters is smaller than any record in the fixture AND smaller than
+    PrettyDef's 4 KiB header, so this exercises both the header-growth path and
+    the record-refill path on every single record. The counts must be identical
+    to the default window's.
+    """
+    tmp = tempfile.mkdtemp(prefix="measure_tiny_")
+    try:
+        make_hostile_dump(tmp)
+        build(tmp, window=64)
+        db = DumpDB(os.path.join(tmp, DB_NAME))
+        try:
+            assert db.count("ThingDef").unwrap() == 3, db.count("ThingDef").line()
+            assert db.count("PrettyDef").unwrap() == 2, db.count("PrettyDef").line()
+            assert db.count("BetaDef").unwrap() == 1, db.count("BetaDef").line()
+            assert db.count("EmptyDef").unwrap() == 0
+            # and the damage is still damage, not an artefact of the window
+            assert not db.count("BiomeDef").ok
+            assert dict(db.sql("SELECT def_type, coverage FROM capture")
+                        )["BiomeDef"] == "failed"
+        finally:
+            db.close()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 # --------------------------------------------------------------------------
