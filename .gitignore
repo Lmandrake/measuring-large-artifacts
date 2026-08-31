@@ -1,3 +1,7 @@
 __pycache__/
 *.pyc
 *.sqlite
+
+# bench artifacts — generated, large
+big*.json
+small*.json
