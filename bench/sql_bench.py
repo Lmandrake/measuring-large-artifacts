@@ -12,10 +12,19 @@ that made reads slower cannot hide.
 """
 import json, os, sqlite3, sys, time, zlib
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import read_bench as rb  # noqa: E402  (sys.argv guard makes this safe)
-
 SRC = sys.argv[1] if len(sys.argv) > 1 else "big.json"
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# ⚠️ HIDE OUR ARGV WHILE IMPORTING. read_bench runs its benchmark at import time
+# when it sees `<variant> <path>` in sys.argv, so `sql_bench.py big.json --foo`
+# fired read_bench's run() with sql_bench's arguments and died on
+# `KeyError: 'big.json'`. par_bench.py already did this; this one said it did,
+# in a comment, and did not.
+_argv, sys.argv = sys.argv, [sys.argv[0]]
+try:
+    import read_bench as rb  # noqa: E402
+finally:
+    sys.argv = _argv
 
 TABLES = """
 CREATE TABLE defs (
@@ -36,16 +45,12 @@ CREATE TABLE def_flags (def_id INTEGER NOT NULL, key TEXT NOT NULL, value TEXT);
 CREATE TABLE def_tags (def_id INTEGER NOT NULL, kind TEXT NOT NULL, tag TEXT NOT NULL);
 """
 
-INDEXES = """
-CREATE INDEX idx_defs_name  ON defs(def_name);
-CREATE INDEX idx_defs_type  ON defs(def_type);
-CREATE INDEX idx_defs_conc  ON defs(concrete_type);
-CREATE INDEX idx_defs_pkg   ON defs(package_id);
-CREATE INDEX idx_flags      ON def_flags(key, value);
-CREATE INDEX idx_flags_def  ON def_flags(def_id);
-CREATE INDEX idx_tags       ON def_tags(kind, tag);
-CREATE INDEX idx_tags_def   ON def_tags(def_id);
-"""
+#: ⭐ IMPORTED, not retyped. The `now` variant claims to be "the shipped schema",
+#: and a copy of the index list here would go on claiming it after the shipped
+#: one changed — a benchmark measuring a schema nobody runs.
+sys.path.insert(0, os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "scripts"))
+from measure.dumpdb import INDEXES  # noqa: E402
 
 TAG_FIELDS = ("weaponTags", "tradeTags", "techHediffsTags", "thingCategories",
               "apparelTags")
@@ -155,6 +160,7 @@ def probe(variant, dbp, path):
 print("source: %s (%.1f MB)" % (SRC, os.path.getsize(SRC) / 1048576))
 print("%-11s %7s %7s %7s %9s %9s %9s" %
       ("variant", "insert", "index", "total", "db MB", "count ms", "rec ms"))
+os.makedirs("/tmp/mlabench", exist_ok=True)   # else every variant dies on connect
 for variant in ("now", "after", "after+prag", "zlib", "nojson"):
     dbp = "/tmp/mlabench/%s.sqlite" % variant.replace("+", "_")
     ins, idx, n = build(variant, SRC, dbp)

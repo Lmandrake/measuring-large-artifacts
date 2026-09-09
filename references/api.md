@@ -28,7 +28,7 @@
 | `measure flag <key> [--value V]` | how many records the producer classified this way |
 | `measure csv <path> --where col=value` | count rows without counting the header |
 | `measure count-errors <log> [--top N]` | how many DISTINCT errors in a log, not how many stack-trace lines |
-| `measure verify` | check the built form against the source, record by record |
+| `measure verify` | re-parse the source and check its per-slice counts against the built form |
 | `measure explain <path>` | what IS this file, and what may read it |
 | `measure sql "SELECT …"` | read-only escape hatch |
 
@@ -53,6 +53,14 @@ code as `coverage`.
 🔑 64 rather than argparse's default 2 is deliberate: 2 already means
 `UNMEASURED`, so a typo would be indistinguishable from a real finding and a
 shell caller would treat its own bug as evidence.
+
+⛔ **`measure sql` ALWAYS exits 3, including when it returns rows.** That is not
+an error report: raw rows carry no coverage, so the command refuses to *vouch*
+for what they mean while still printing them under a `RAW` line. So the idiom
+below is wrong for `sql` — branching on its status throws away real rows. Read
+its output, or ask the question with `count` / `coverage` / `find`, which do
+carry a verdict. (`build` follows the ordinary codes: 0 when it captured
+something, 2 when it captured nothing or every type failed.)
 
 So a shell caller can branch on ignorance without parsing text:
 

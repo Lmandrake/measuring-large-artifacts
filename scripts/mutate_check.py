@@ -88,9 +88,125 @@ MUTATIONS = [
     (
         "find's zero is no longer gated on coverage",
         "measure/dumpdb.py",
-        "        if not solid:\n            if blind:",
-        "        if not solid:\n            if False:",
+        "            if blind or murky:",
+        "            if False:",
         "find_zero_is_UNMEASURED_unless_every_slice_was_searchable",
+    ),
+    # ---- the 2026-09-09 finder sweep. Each pairs with the case that caught
+    # the real defect, so the case cannot quietly stop testing for it.
+    (
+        "find's zero is gated on unreadable slices but not on unattributable hits",
+        "measure/dumpdb.py",
+        "            if blind or murky:",
+        "            if blind:",
+        "find_zero_refuses_when_a_hit_cannot_be_attributed",
+    ),
+    (
+        "find's blind gate ignores the --type scope again",
+        "measure/dumpdb.py",
+        "cov, blind, n_scope = self._attribution(def_type)",
+        "cov, blind, n_scope = self._attribution(None)",
+        "a_scoped_find_is_not_refused_for_an_unrelated_broken_slice",
+    ),
+    (
+        "a dropped slice keeps its tag and flag rows",
+        "measure/dumpdb.py",
+        '    con.execute("DELETE FROM def_tags WHERE def_id IN (%s)" % ids, (def_type,))\n'
+        '    con.execute("DELETE FROM def_flags WHERE def_id IN (%s)" % ids, (def_type,))\n',
+        "",
+        "a_dropped_slice_takes_its_tags_and_flags_with_it",
+    ),
+    (
+        "tag() counts rows from a slice the capture cannot vouch for",
+        "measure/dumpdb.py",
+        '            "JOIN defs d ON d.id = t.def_id WHERE t.kind=? AND t.tag=?",\n'
+        "            (kind, tag),\n        ).fetchall()\n"
+        "        solid = [r for r in rows if cov(r[1], r[2]) in self._VOUCHABLE]",
+        '            "JOIN defs d ON d.id = t.def_id WHERE t.kind=? AND t.tag=?",\n'
+        "            (kind, tag),\n        ).fetchall()\n"
+        "        solid = rows",
+        "get_is_coverage_gated_exactly_like_count_and_record",
+    ),
+    (
+        "flag() counts rows from a slice the capture cannot vouch for",
+        "measure/dumpdb.py",
+        '            "JOIN defs d ON d.id = f.def_id WHERE f.key=? AND f.value=?",\n'
+        "            (key, value),\n        ).fetchall()\n"
+        "        solid = [r for r in rows if cov(r[1], r[2]) in self._VOUCHABLE]",
+        '            "JOIN defs d ON d.id = f.def_id WHERE f.key=? AND f.value=?",\n'
+        "            (key, value),\n        ).fetchall()\n"
+        "        solid = rows",
+        "get_is_coverage_gated_exactly_like_count_and_record",
+    ),
+    (
+        "get() answers from a slice count and record both refuse",
+        "measure/dumpdb.py",
+        "        solid = [r for r in rows if cov(r[0], r[5]) in self._VOUCHABLE]",
+        "        solid = rows",
+        "get_is_coverage_gated_exactly_like_count_and_record",
+    ),
+    (
+        "records() binds one argument to two placeholders",
+        "measure/dumpdb.py",
+        "        args = (def_type, def_type) if dotted else (def_type,)",
+        "        args = (def_type,)",
+        "a_dotted_type_name_can_actually_be_asked_for_its_records",
+    ),
+    (
+        "the manifest is read as plain utf-8, so a BOM kills the build",
+        "measure/dumpdb.py",
+        '    with open(path, "r", encoding="utf-8-sig") as fh:\n'
+        "        manifest = json.loads",
+        '    with open(path, "r", encoding="utf-8") as fh:\n'
+        "        manifest = json.loads",
+        "a_BOM_on_the_manifest_does_not_kill_the_whole_build",
+    ),
+    (
+        "the build abandons a shadowed file without closing it",
+        "measure/dumpdb.py",
+        "            it.close()          # nothing will be read from it; see _DefIter",
+        "            pass",
+        "the_build_closes_a_file_it_reads_nothing_from",
+    ),
+    (
+        "a file that fails at open is not counted as a type seen",
+        "measure/dumpdb.py",
+        "            stats.types_seen += 1\n            continue\n\n        inner_type",
+        "            continue\n\n        inner_type",
+        "types_captured_counts_every_capture_row_a_file_wrote",
+    ),
+    (
+        "an empty capture reads as complete coverage",
+        "measure/cli.py",
+        "    if total == 0:",
+        "    if False:",
+        "a_capture_that_holds_nothing_is_not_a_clean_build",
+    ),
+    (
+        "a build that captured nothing still reports MEASURED",
+        "measure/cli.py",
+        "    if stats.types_seen == 0 or (stats.defs_inserted == 0 and stats.failed):",
+        "    if False:",
+        "a_build_where_every_file_failed_is_not_MEASURED_zero",
+    ),
+    (
+        "the multi-statement guard is a raw ';' substring test again",
+        "measure/cli.py",
+        "    try:\n        rows = db.sql(q)",
+        '    if ";" in q.rstrip().rstrip(";"):\n'
+        "        return emit(Refused(\n"
+        '            reason="one statement at a time",\n'
+        '            artifact="sql", instrument="dumpdb.sql",\n'
+        '            right_instrument="run the statements separately"))\n'
+        "    try:\n        rows = db.sql(q)",
+        "a_semicolon_inside_a_literal_is_not_two_statements",
+    ),
+    (
+        "the log reader assumes utf-8 whatever the file is",
+        "measure/playerlog.py",
+        "getincrementaldecoder(_sniff_encoding(head))",
+        'getincrementaldecoder("utf-8")',
+        "a_utf16_log_is_read_rather_than_dismissed_as_not_a_log",
     ),
     (
         "find searches only the raw literal, not its escaped forms",
@@ -112,9 +228,16 @@ MUTATIONS = [
 
 
 def run_suite(root):
+    # 🔑 POINTED AT A DUMP THAT IS NOT THERE, ON PURPOSE. The live cases are
+    # SKIPPED whenever the machine has no capture — so on almost every machine
+    # they can never be the case that catches a mutation, and a detection that
+    # depends on one operator's 877 MB defs.sqlite is not a detection. Skipping
+    # them here also keeps a run to seconds per mutation instead of minutes: the
+    # live suite alone takes over ten on this drive, times one run per mutation.
+    env = dict(os.environ, RIMWORLD_DEFDUMP=os.path.join(root, "no_such_dump"))
     r = subprocess.run([sys.executable,
                         os.path.join(root, "selftest_measure.py")],
-                       capture_output=True, text=True)
+                       capture_output=True, text=True, env=env)
     failed = set(re.findall(r"^FAIL  (\S+)", r.stdout, re.M))
     errored = set(re.findall(r"^ERROR (\S+)", r.stdout, re.M))
     return failed, errored, r.stdout

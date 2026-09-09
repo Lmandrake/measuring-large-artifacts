@@ -52,6 +52,7 @@ not look like a RimWorld Player.log at all, it returns UNMEASURED rather than 0 
 
 from __future__ import annotations
 
+import codecs
 import hashlib
 import os
 import re
@@ -114,6 +115,79 @@ _MASKS = (
 #: Cheap proof that this really is a RimWorld log before any number is reported.
 _SIGNATURES = ("RimWorld 1.", "Mono path[0]", "Ludeon Studios")
 
+#: How much of the file decides its encoding. A BOM is in the first two bytes;
+#: the NUL-position test below only needs enough text to be unambiguous.
+_SNIFF = 4096
+
+
+def _sniff_encoding(head: bytes) -> str:
+    """Which codec this log is written in.
+
+    🔴 A LOG IS NOT ALWAYS UTF-8, and the old reader assumed it was. It split
+    the file on the byte 0x0A and decoded each piece as UTF-8 with `replace`,
+    which for a UTF-16 log turns `RimWorld 1.6` into `R\\x00i\\x00m\\x00…`: the
+    signature never matches, every opener regex fails, and a log full of real
+    errors comes back UNMEASURED with the reason *"this is not a Player.log"* —
+    ignorance dressed as a diagnosis about the wrong thing. UTF-16 is what a
+    PowerShell redirect (`>`, `Tee-Object`) writes by default on Windows, which
+    is exactly how a log gets copied out of the game directory.
+    """
+    if head.startswith(b"\xff\xfe\x00\x00") or head.startswith(b"\x00\x00\xfe\xff"):
+        return "utf-32"
+    if head.startswith(b"\xff\xfe") or head.startswith(b"\xfe\xff"):
+        return "utf-16"                    # the codec consumes its own BOM
+    if head.startswith(b"\xef\xbb\xbf"):
+        return "utf-8-sig"
+    # No BOM: a UTF-16 file of mostly-ASCII text is half NUL bytes, and WHICH
+    # half says the endianness. A UTF-8 log has essentially none.
+    sample = head[: len(head) - len(head) % 2]
+    if sample.count(0) > len(sample) // 4:
+        even = sum(1 for i in range(0, len(sample), 2) if sample[i] == 0)
+        odd = sum(1 for i in range(1, len(sample), 2) if sample[i] == 0)
+        return "utf-16-be" if even > odd else "utf-16-le"
+    return "utf-8"
+
+
+def _enc_used(path: str) -> str:
+    """Which codec the reader chose — named in the refusal, because "this is not
+    a Player.log" is a very different diagnosis from "I read it as UTF-8 and it
+    is UTF-16"."""
+    try:
+        with open(path, "rb") as fh:
+            return _sniff_encoding(fh.read(_SNIFF))
+    except OSError:                                  # pragma: no cover
+        return "unknown"
+
+
+def _lines(fh, digest):
+    """Yield decoded lines, feeding `digest` the RAW bytes.
+
+    The fingerprint is over the bytes on disk, not over the decoded text, so it
+    identifies the file regardless of how it had to be read.
+    """
+    head = fh.read(_SNIFF)
+    digest.update(head)
+    dec = codecs.getincrementaldecoder(_sniff_encoding(head))(errors="replace")
+    buf = dec.decode(head)
+    while True:
+        chunk = fh.read(1 << 20)
+        if chunk:
+            digest.update(chunk)
+            buf += dec.decode(chunk)
+        else:
+            buf += dec.decode(b"", True)
+        # ⚠️ Split on the DECODED text. Splitting the bytes on 0x0A is what
+        # broke UTF-16: a UTF-16LE newline is `0a 00`, so every byte-split line
+        # after the first starts one byte out of phase and decodes to noise.
+        parts = buf.split("\n")
+        buf = parts.pop()
+        for part in parts:
+            yield part.rstrip("\r")
+        if not chunk:
+            if buf:
+                yield buf.rstrip("\r")
+            return
+
 
 def _normalise(line: str) -> str:
     out = line.strip()
@@ -164,14 +238,8 @@ def count_errors(path: str, top: int = 0):
     in_block = False
 
     with open(path, "rb") as fh:
-        for raw in fh:
-            digest.update(raw)
+        for line in _lines(fh, digest):
             lines += 1
-            try:
-                line = raw.decode("utf-8", "replace")
-            except Exception:                       # pragma: no cover
-                continue
-            line = line.rstrip("\r\n")
             if not seen_signature and any(s in line for s in _SIGNATURES):
                 seen_signature = True
             if not line.strip():
@@ -191,7 +259,8 @@ def count_errors(path: str, top: int = 0):
         return Unmeasured(
             reason="no RimWorld signature line (RimWorld 1.x / Mono path / Ludeon "
                    "Studios) in the whole file, so this is not a Player.log and a "
-                   "count of its 'errors' would be a plausible wrong number",
+                   "count of its 'errors' would be a plausible wrong number "
+                   "(read as %s)" % _enc_used(path),
             artifact=path, instrument="measure.count-errors",
             remedy="point at the real Player.log, or read this file directly")
 

@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import fnmatch
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 
 @dataclass(frozen=True)
@@ -143,7 +143,12 @@ REGISTRY = (
             "multi-line stack traces and repeated identical lines; a grep -c "
             "counts LINES, and one error spanning 30 lines is not 30 errors"
         ),
-        instrument="harvest_log.py (RimWorld), or any reader that groups stack traces rather than counting lines",
+        # ⭐ `measure count-errors` FIRST: it is this package's own answer to the
+        # question the encoding note is about, and until it was named here the
+        # registry refused a scan while pointing at a tool that prints a report
+        # and cannot say MEASURED or UNMEASURED at all.
+        instrument=("measure count-errors <log> for how many DISTINCT errors; "
+                    "harvest_log.py (RimWorld) for the triage report"),
         literal_scan_ok=True,
         ours=False,
         notes=(

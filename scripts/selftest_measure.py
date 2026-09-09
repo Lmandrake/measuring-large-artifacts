@@ -699,6 +699,12 @@ def t_tags_are_a_join_not_a_hand_built_index():
             "a tag no def carries returned a number; it must refuse, because a "
             "Cherry Picker cut NEUTERS a def rather than deleting it: %s" % dead.line())
         assert isinstance(dead, Refused), dead.line()
+        # A field the builder does not index at all is a different answer again:
+        # "nothing carries that" would be a statement about a table nobody wrote.
+        unknown = db.tag("Gun", kind="madeUpTags")
+        assert isinstance(unknown, Refused), unknown.line()
+        assert "weaponTags" in unknown.line(), (
+            "the refusal must name the kinds that DO exist: %s" % unknown.line())
     finally:
         db.close()
         shutil.rmtree(tmp, ignore_errors=True)
@@ -1588,6 +1594,476 @@ def t_a_file_that_is_not_a_log_is_refused_not_measured_zero():
     m = playerlog.count_errors(p)
     assert not m.ok, "a markdown file must not mint a measurement: " + m.line()
     assert "REFUSED" in m.line(), m.line()
+
+
+# --------------------------------------------------------------------------
+# finder sweep, 2026-09-09 — each case below pins ONE demonstrated defect.
+#
+# 🔑 Every one of these was reproduced against the shipped code FIRST, in a
+# throwaway dump, and the wrong answer is quoted in the docstring. A case whose
+# failure was never seen is a hypothesis; `scripts/mutate_check.py` carries the
+# matching mutation so each stays one.
+# --------------------------------------------------------------------------
+
+def _mini_dump(tmp, files, defcounts, def_types=""):
+    """A capture built from raw text, so a fixture can be as broken as it likes.
+
+    `files` maps filename -> a dict (serialised) or a raw string (which is how a
+    truncated file is written). `defcounts` is the manifest's `defCounts` object
+    AS TEXT, because duplicate keys are the evidence and no dict holds one.
+    """
+    defs_dir = os.path.join(tmp, "defs")
+    os.makedirs(defs_dir, exist_ok=True)
+    for fname, obj in files.items():
+        with open(os.path.join(defs_dir, fname), "w", encoding="utf-8") as fh:
+            fh.write(obj if isinstance(obj, str)
+                     else json.dumps(obj, separators=(",", ":")))
+    with open(os.path.join(tmp, "manifest.json"), "w", encoding="utf-8") as fh:
+        fh.write('{"tool":"T","toolVersion":"1","mode":"all",'
+                 '"capturedUtc":"2026-01-01T00:00:00Z","gameVersion":"1.6",'
+                 '"modCount":1,"mods":[{"loadOrder":1,"name":"Core",'
+                 '"packageId":"ludeon.rimworld"}],'
+                 + def_types + '"defCounts":' + defcounts + '}')
+    return tmp
+
+
+def _rec(name, dtype, full=None, i=0, is_block=None, **fields):
+    d = {"defName": name, "defType": dtype, "label": name, "shortHash": 1000 + i,
+         "modName": "Core", "packageId": "p.q", "fields": fields}
+    if full:
+        d["defTypeFull"] = full
+    if is_block:
+        d["is"] = is_block
+    return d
+
+
+def _slice(dtype, defs, full=None, count=None):
+    obj = {"defType": dtype, "defs": defs,
+           "count": len(defs) if count is None else count}
+    if full:
+        obj["defTypeFull"] = full
+    return obj
+
+
+def _damaged_dump(tmp):
+    """One healthy slice, one slice whose file is TRUNCATED — and the broken one
+    carries tags and flags, which is what makes it interesting."""
+    broken = json.dumps(_slice(
+        "BrokenDef",
+        [_rec("Bk%d" % i, "BrokenDef", "V.BrokenDef", i,
+              is_block={"weapon": True},          # so def_flags has teeth too
+              weaponTags=["Gun", "OnlyBroken"]) for i in range(4)],
+        full="V.BrokenDef"), separators=(",", ":"))
+    return _mini_dump(tmp, {
+        "ThingDef.json": _slice("ThingDef",
+                                [_rec("Gun_A", "ThingDef", "V.ThingDef", 0,
+                                      weaponTags=["Gun"]),
+                                 _rec("Rock", "ThingDef", "V.ThingDef", 1)],
+                                full="V.ThingDef"),
+        "BrokenDef.json": broken[: int(len(broken) * 0.8)],
+    }, '{"ThingDef":2,"BrokenDef":4}')
+
+
+def t_a_dropped_slice_takes_its_tags_and_flags_with_it():
+    """🔴 `measure tag OnlyBroken` -> **MEASURED 3**, for records that are not in
+    the database at all.
+
+    The two repair paths in `build` delete a refused slice's `defs` rows and used
+    to leave its `def_tags` / `def_flags` rows behind, pointing at ids that no
+    longer exist — and `tag()`/`flag()` counted those side tables directly, with
+    no join and no coverage gate. So a slice the build had just refused to vouch
+    for went on minting a confident number, which is this package's canonical
+    failure committed by the package itself.
+    """
+    tmp = tempfile.mkdtemp(prefix="measure_drop_")
+    try:
+        _damaged_dump(tmp)
+        build(tmp)
+        db = DumpDB(os.path.join(tmp, DB_NAME))
+        try:
+            assert db.count("BrokenDef").ok is False, "the fixture is not damaged"
+            for side in ("def_tags", "def_flags"):
+                orphaned = db.sql(
+                    "SELECT COUNT(*) FROM %s s LEFT JOIN defs d ON d.id = s.def_id "
+                    "WHERE d.id IS NULL" % side)[0][0]
+                assert orphaned == 0, (
+                    "%d %s rows survive the defs they belong to" % (orphaned, side))
+            m = db.tag("OnlyBroken")
+            assert not m.ok, (
+                "a tag carried only by a slice the build REFUSED came back as a "
+                "measurement: %s" % m.line())
+            # and the healthy slice still answers
+            assert db.tag("Gun").unwrap() == 1, db.tag("Gun").line()
+        finally:
+            db.close()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def t_get_is_coverage_gated_exactly_like_count_and_record():
+    """🔴 One db, one second, three answers: `count ThingDef` UNMEASURED,
+    `record Gun_A` UNMEASURED, and `get Gun_A` **MEASURED 1** — from a `partial`
+    slice, i.e. a file that declares five records and parsed two.
+
+    `get`'s remedy text had always ADVISED running `coverage` first. Advice is
+    not a gate, and the cheapest of the three answers was the wrong one.
+
+    ⭐ `tag` and `flag` are asserted on the SAME slice, because a partial slice
+    keeps its rows — so unlike a dropped one it is what proves the gate rather
+    than the deletion. Their records are there; what is missing is the right to
+    call the number complete.
+    """
+    tmp = tempfile.mkdtemp(prefix="measure_getcov_")
+    try:
+        _mini_dump(tmp, {"ThingDef.json": _slice(
+            "ThingDef", [_rec("Gun_A", "ThingDef", "V.ThingDef", 0,
+                              is_block={"weapon": True},
+                              weaponTags=["PartialGun"]),
+                         _rec("Gun_B", "ThingDef", "V.ThingDef", 1)],
+            full="V.ThingDef", count=5)}, '{"ThingDef":5}')
+        build(tmp)
+        db = DumpDB(os.path.join(tmp, DB_NAME))
+        try:
+            assert db.sql("SELECT coverage FROM capture")[0][0] == "partial"
+            assert db.sql("SELECT COUNT(*) FROM def_tags")[0][0] == 1, (
+                "the fixture lost its tag row")
+            assert not db.count("ThingDef").ok
+            assert not db.record("Gun_A").ok
+            got = db.get("Gun_A")
+            assert not got.ok, (
+                "get answered from a slice count and record both refuse: %s"
+                % got.line())
+            tagged = db.tag("PartialGun")
+            assert not tagged.ok, (
+                "tag counted a def whose own slice is partial: %s" % tagged.line())
+            flagged = db.flag("weapon")
+            assert not flagged.ok, (
+                "flag counted a def whose own slice is partial: %s"
+                % flagged.line())
+        finally:
+            db.close()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _unattributable_dump(tmp):
+    """Every slice vouchable, one hit that cannot be attributed to either.
+
+    Two files share the simple name `AbilityDef`. The first is resolved by the
+    manifest's `defTypes` index (complete); the second is not indexed and carries
+    no `defTypeFull` anywhere, and its simple name was written twice with the
+    earlier writer holding 0 defs — which is `ambiguous`, a VOUCHABLE state. So
+    `AbilityDef` maps to two different coverage states, its records carry no full
+    name to attribute by, and nothing in the capture is `blind`.
+    """
+    return _mini_dump(tmp, {
+        "AbilityDef.json": _slice("AbilityDef",
+                                  [_rec("Ab1", "AbilityDef", "Verse.AbilityDef", 0)],
+                                  full="Verse.AbilityDef"),
+        "Other.AbilityDef.json": _slice(
+            "AbilityDef", [_rec("Vef1", "AbilityDef", None, 0,
+                                weaponTags=["ZZUNIQUE"])]),
+    }, '{"AbilityDef":0,"AbilityDef":1}',
+        def_types=('"defTypes":[{"name":"AbilityDef",'
+                   '"fullName":"Verse.AbilityDef","file":"AbilityDef.json"}],'))
+
+
+def t_find_zero_refuses_when_a_hit_cannot_be_attributed():
+    """🔴 `find ZZUNIQUE` -> **MEASURED 0 … every slice in this capture is
+    complete, so this is a measured absence** — with the string sitting in a
+    record of that very capture.
+
+    `find` collected `solid` (hits it can vouch for) and `murky` (hits whose
+    slice it could not attribute), and then gated its zero on `blind` alone —
+    a count of unreadable SLICES. `murky` can be non-zero while `blind` is zero,
+    and there the elision turned found-but-unvouchable into measured-absent.
+    """
+    tmp = tempfile.mkdtemp(prefix="measure_murk_")
+    try:
+        _unattributable_dump(tmp)
+        build(tmp)
+        db = DumpDB(os.path.join(tmp, DB_NAME))
+        try:
+            assert db.sql("SELECT COUNT(*) FROM capture WHERE coverage NOT IN "
+                          "('complete','ambiguous')")[0][0] == 0, (
+                "the fixture has a blind slice, so it does not test `murky`")
+            assert db.sql("SELECT COUNT(*) FROM defs "
+                          "WHERE instr(json,'ZZUNIQUE')>0")[0][0] == 1, (
+                "the fixture lost its hit")
+            m = db.find("ZZUNIQUE")
+            assert not m.ok, (
+                "a literal that IS in the capture came back as a measured "
+                "absence: %s" % m.line())
+        finally:
+            db.close()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def t_a_scoped_find_is_not_refused_for_an_unrelated_broken_slice():
+    """An unearned refusal, which is how an instrument gets routed around.
+
+    `find X --type ThingDef` over a COMPLETE ThingDef was UNMEASURED because
+    some other type — never searched, never relevant — was truncated. The gate
+    is scoped to the slices the search could actually have covered.
+    """
+    tmp = tempfile.mkdtemp(prefix="measure_scope_")
+    try:
+        _damaged_dump(tmp)
+        build(tmp)
+        db = DumpDB(os.path.join(tmp, DB_NAME))
+        try:
+            assert not db.find("NeverAnywhere").ok, (
+                "unscoped, the damaged slice must still refuse the zero")
+            m = db.find("NeverAnywhere", def_type="ThingDef")
+            assert m.ok and m.value == 0, (
+                "a complete slice cannot answer its own question because a "
+                "different type is broken: %s" % m.line())
+            hit = db.find("Gun_A", def_type="ThingDef")
+            assert hit.ok and hit.value == 1, hit.line()
+            # ...and a scope that matches no slice at all is ignorance, not a
+            # measured absence: `--type Typo` must never answer 0.
+            nowhere = db.find("Gun_A", def_type="NoSuchDefType")
+            assert not nowhere.ok, nowhere.line()
+        finally:
+            db.close()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def t_a_dotted_type_name_can_actually_be_asked_for_its_records():
+    """`records('Verse.AbilityDef')` died with `sqlite3.ProgrammingError:
+    Incorrect number of bindings supplied. The current statement uses 2, and
+    there are 1 supplied` — the branch that exists FOR the dotted name was the
+    one that could not run, and a resolved collision is the only case where the
+    dotted name is the question you must ask."""
+    tmp = tempfile.mkdtemp(prefix="measure_dot_")
+    try:
+        _unattributable_dump(tmp)
+        build(tmp)
+        db = DumpDB(os.path.join(tmp, DB_NAME))
+        try:
+            m = db.records("Verse.AbilityDef")
+            assert m.ok, m.line()
+            assert [r["defName"] for r in m.unwrap()] == ["Ab1"], m.unwrap()
+        finally:
+            db.close()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def t_a_BOM_on_the_manifest_does_not_kill_the_whole_build():
+    """The producer that writes a BOM'd defs file writes a BOM'd manifest, and
+    `iter_defs` had learned that (`utf-8-sig`) while `read_manifest` had not — so
+    `build` died with `json.JSONDecodeError: Unexpected UTF-8 BOM`, uncaught,
+    for a capture the reader on the other side of the module handles fine."""
+    tmp = tempfile.mkdtemp(prefix="measure_bom_")
+    try:
+        _mini_dump(tmp, {"ThingDef.json": _slice(
+            "ThingDef", [_rec("Gun_A", "ThingDef", "V.ThingDef", 0)],
+            full="V.ThingDef")}, '{"ThingDef":1}')
+        p = os.path.join(tmp, "manifest.json")
+        with open(p, "rb") as fh:
+            body = fh.read()
+        with open(p, "wb") as fh:
+            fh.write(b"\xef\xbb\xbf" + body)
+        build(tmp)
+        db = DumpDB(os.path.join(tmp, DB_NAME))
+        try:
+            assert db.count("ThingDef").unwrap() == 1, db.count("ThingDef").line()
+        finally:
+            db.close()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def t_the_build_closes_a_file_it_reads_nothing_from():
+    """A shadowed collision decides from the HEADER and never reads a record.
+
+    The stream used to be a generator that closed its file in its own `finally`
+    — and a generator that was never started runs no code when it is closed, so
+    the handle survived to garbage collection. One leaked descriptor per
+    collision (13 on the real dump), and on Windows an open handle is what makes
+    the producer's next `os.replace` of that file fail.
+    """
+    import measure.dumpdb as dd
+    tmp = tempfile.mkdtemp(prefix="measure_fd_")
+    try:
+        _mini_dump(tmp, {
+            "A.json": _slice("DupDef", [_rec("D1", "DupDef", "X.DupDef", 0)],
+                             full="X.DupDef"),
+            "B.json": _slice("DupDef", [_rec("D2", "DupDef", "Y.DupDef", 0)],
+                             full="Y.DupDef"),
+        }, '{"DupDef":1}')
+        streams, real = [], dd.iter_defs
+
+        def spy(path, window=dd.WINDOW):
+            header, it = real(path, window=window)
+            streams.append(it)          # ⭐ a live reference, so refcounting
+            return header, it           #    cannot mask the leak
+        dd.iter_defs = spy
+        try:
+            build(tmp)
+        finally:
+            dd.iter_defs = real
+        assert len(streams) == 2, "the fixture did not produce a collision"
+        left = [s for s in streams
+                if getattr(s, "_fh", None) is not None and not s._fh.closed]
+        assert not left, (
+            "%d file(s) the build abandoned are still open" % len(left))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def t_types_captured_counts_every_capture_row_a_file_wrote():
+    """`provenance.types_captured` and the `capture` table must tell one story.
+
+    A file whose header cannot be read is recorded as `failed` — and that branch
+    alone did not count the type, while the branch for a file that fails PART
+    WAY through did. The same damage then reported a different number depending
+    on which byte it surfaced at.
+    """
+    tmp = tempfile.mkdtemp(prefix="measure_seen_")
+    try:
+        _mini_dump(tmp, {
+            "ThingDef.json": _slice("ThingDef",
+                                    [_rec("Gun_A", "ThingDef", "V.ThingDef", 0)],
+                                    full="V.ThingDef"),
+            "HeadlessDef.json": "not json at all",
+        }, '{"ThingDef":1,"HeadlessDef":2}')
+        stats = build(tmp)
+        db = DumpDB(os.path.join(tmp, DB_NAME))
+        try:
+            from_files = db.sql(
+                "SELECT COUNT(*) FROM capture WHERE source_file IS NOT NULL")[0][0]
+            assert int(db.prov["types_captured"]) == from_files == stats.types_seen, (
+                "types_captured=%s but %d capture rows came from files"
+                % (db.prov["types_captured"], from_files))
+        finally:
+            db.close()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _run_cli(tmp_db=None, dump=None, *argv):
+    import subprocess
+    cli = os.path.join(HERE, "measure", "cli.py")
+    cmd = [sys.executable, cli]
+    if tmp_db:
+        cmd += ["--db", tmp_db]
+    if dump:
+        cmd += ["--dump", dump]
+    r = subprocess.run(cmd + list(argv), capture_output=True, text=True)
+    return r.returncode, r.stdout
+
+
+def t_a_capture_that_holds_nothing_is_not_a_clean_build():
+    """🔴 `measure build` on an empty capture printed `MEASURED 0 defs built …
+    (0 types …)` and exited 0, and `measure coverage` on the result printed
+    `MEASURED 0 def types complete`, exit 0.
+
+    Total absence of evidence, rendered by two commands as a clean measurement —
+    by the command that PRODUCES the artifact and the command whose whole job is
+    to say what is missing. A caller scripting `measure build && measure count X`
+    read a total failure as success.
+    """
+    tmp = tempfile.mkdtemp(prefix="measure_void_")
+    try:
+        _mini_dump(tmp, {}, "{}")
+        rc, out = _run_cli(None, tmp, "build")
+        assert rc == 2 and "UNMEASURED" in out, "build: rc=%d %s" % (rc, out)
+        rc, out = _run_cli(None, tmp, "coverage")
+        assert rc == 2 and "UNMEASURED" in out, "coverage: rc=%d %s" % (rc, out)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def t_a_build_where_every_file_failed_is_not_MEASURED_zero():
+    """The other half: files exist, none of them parses, and the old exit code
+    was still 0 with a `MEASURED 0` line."""
+    tmp = tempfile.mkdtemp(prefix="measure_allbad_")
+    try:
+        _mini_dump(tmp, {"ThingDef.json": '{"defType":"ThingDef","defs":[{"defName"'},
+                   '{"ThingDef":5}')
+        rc, out = _run_cli(None, tmp, "build")
+        assert rc == 2 and "UNMEASURED" in out, "rc=%d %s" % (rc, out)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def t_a_semicolon_inside_a_literal_is_not_two_statements():
+    """The multi-statement guard was `if ";" in q.rstrip().rstrip(";")`, which
+    cannot tell a separator from a quoted character — so `SELECT ';'` and
+    `… WHERE def_name = 'a;b'` were refused as "one statement at a time".
+    sqlite is the only thing here that can parse SQL, so it judges."""
+    tmp = tempfile.mkdtemp(prefix="measure_semi_")
+    try:
+        _mini_dump(tmp, {"ThingDef.json": _slice(
+            "ThingDef", [_rec("Gun_A", "ThingDef", "V.ThingDef", 0)],
+            full="V.ThingDef")}, '{"ThingDef":1}')
+        build(tmp)
+        db = os.path.join(tmp, DB_NAME)
+        for q in ("SELECT ';' AS x",
+                  "SELECT def_name FROM defs WHERE def_name = 'a;b'"):
+            rc, out = _run_cli(db, None, "sql", q)
+            assert "RAW" in out and "one statement" not in out, (
+                "%r was refused as multi-statement: %s" % (q, out))
+        rc, out = _run_cli(db, None, "sql", "SELECT 1; SELECT 2")
+        assert "REFUSED" in out and "one statement" in out, out
+        assert rc == 3, rc
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def t_a_utf16_log_is_read_rather_than_dismissed_as_not_a_log():
+    """🔴 A UTF-16 Player.log — what a PowerShell redirect writes by default —
+    came back UNMEASURED with the reason *"this is not a Player.log"*.
+
+    The reader split the file on the byte 0x0A and decoded each piece as UTF-8,
+    so every line after the first was one byte out of phase and decoded to
+    noise: no signature, no opener, and a diagnosis about the wrong thing.
+    """
+    from measure import playerlog
+    body = ("Mono path[0] = 'x'\nRimWorld 1.6.4871 rev591\n\n"
+            "Exception loading def from file A.xml: System.ArgumentNullException: "
+            "Value cannot be null.\n"
+            "  at System.Single.Parse (System.String s) [0x00003] in <51fded79cd>:0 \n\n"
+            "Config error in SignWoodenMulti: impassable, player-buildable.\n")
+    d = tempfile.mkdtemp(prefix="measure_u16_")
+    try:
+        expect = playerlog.count_errors(
+            _write(os.path.join(d, "Player.log"), body.encode("utf-8")))
+        assert expect.ok and expect.value == 2, expect.line()
+        for enc in ("utf-16", "utf-16-le", "utf-16-be"):
+            p = _write(os.path.join(d, "Player.log"), body.encode(enc))
+            m = playerlog.count_errors(p)
+            assert m.ok, "%s log: %s" % (enc, m.line())
+            assert m.value == expect.value, (
+                "%s log counted %s errors, utf-8 counted %s"
+                % (enc, m.value, expect.value))
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def _write(path, data: bytes) -> str:
+    with open(path, "wb") as fh:
+        fh.write(data)
+    return path
+
+
+def t_a_bench_script_never_runs_another_ones_benchmark():
+    """`bench/sql_bench.py` imports `read_bench`, which runs its benchmark AT
+    IMPORT when sys.argv looks like `<variant> <path>`. With three argv entries
+    that fired with sql_bench's own arguments and died on `KeyError`. The
+    comment beside the import claimed a guard that was not there."""
+    import subprocess
+    bench = os.path.join(os.path.dirname(HERE), "bench", "sql_bench.py")
+    if not os.path.exists(bench):
+        raise _Skip("no bench/ beside this skill")
+    r = subprocess.run([sys.executable, bench, "no_such_source.json", "extra"],
+                       capture_output=True, text=True)
+    assert "KeyError" not in r.stderr, (
+        "sql_bench ran read_bench's benchmark with its own argv:\n%s" % r.stderr)
 
 
 if __name__ == "__main__":

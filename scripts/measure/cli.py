@@ -55,9 +55,42 @@ class _Parser(argparse.ArgumentParser):
         raise SystemExit(EXIT_USAGE)
 
 
+#: The verdict comes from the OBJECT, not from re-reading the printed line.
+#: Deriving it by splitting `m.line()` meant the exit code depended on how a
+#: Measurement renders its first word — so a wording change anywhere in
+#: result.py would silently move an exit code, which is the one part of this
+#: tool a shell caller branches on.
+_EXIT_FOR = {Measured: EXIT["MEASURED"], Unmeasured: EXIT["UNMEASURED"],
+             Refused: EXIT["REFUSED"]}
+
+
 def emit(m) -> int:
     print(m.line())
-    return EXIT[m.line().split(" ", 1)[0]]
+    return _EXIT_FOR[type(m)]
+
+
+def _rows_footer(shown: int, total: int) -> None:
+    """`... N more (use --rows)`, in one place.
+
+    One line per question is the design; eliding SILENTLY is how a partial list
+    gets quoted as a complete one, so every command that truncates says so the
+    same way.
+    """
+    if total > shown:
+        print(f"... {total - shown} more (use --rows)")
+
+
+def _file_sha256(path: str, prefix: int = 16) -> str:
+    """Fingerprint a file that is small enough to read whole.
+
+    ⛔ Not for the def dump: this is a full read, and at 646 MB that is a
+    question nobody would ask twice.
+    """
+    digest = _hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()[:prefix]
 
 
 def _db(args) -> DumpDB:
@@ -68,7 +101,7 @@ def _db(args) -> DumpDB:
             artifact="dumpdb",
             remedy="measure build",
         ).line())
-        raise SystemExit(2)
+        raise SystemExit(EXIT["UNMEASURED"])
     return DumpDB(path)
 
 
@@ -83,13 +116,30 @@ def cmd_build(args) -> int:
     root, dump = split_capture_layout(args.dump or default_dump_dir())
     stats = build(dump, db_path=args.db or os.path.join(root, DB_NAME),
                   only=set(args.only) if args.only else None)
-    print(
-        f"MEASURED {stats.defs_inserted} defs built from {dump} "
-        f"({stats.types_seen} types; absent={stats.absent} "
-        f"shadowed={stats.shadowed} ambiguous={stats.ambiguous} "
-        f"orphan={stats.orphan} partial={stats.partial} "
-        f"failed={stats.failed}) via dumpdb.build"
-    )
+    detail = (f"{stats.types_seen} types; absent={stats.absent} "
+              f"shadowed={stats.shadowed} ambiguous={stats.ambiguous} "
+              f"orphan={stats.orphan} partial={stats.partial} "
+              f"failed={stats.failed}")
+    # 🔴 A BUILD THAT CAPTURED NOTHING IS NOT A MEASUREMENT OF ZERO. This
+    # printed `MEASURED 0 defs built … (0 types …)` and exited 0 for an empty
+    # capture directory, and again when every single file failed to parse — the
+    # tri-state's own rule broken by the command that produces the artifact the
+    # rest of the tri-state is about. A caller scripting `measure build &&
+    # measure count X` read a total failure as a successful build.
+    if stats.types_seen == 0 or (stats.defs_inserted == 0 and stats.failed):
+        return emit(Unmeasured(
+            reason=(f"the build read no def type at all from {dump}"
+                    if stats.types_seen == 0 else
+                    f"no def was inserted and {stats.failed} type(s) failed to "
+                    f"read, so this db can answer nothing") + f" ({detail})",
+            artifact="dumpdb.build",
+            instrument="dumpdb.build",
+            remedy="check the dump directory is the capture (manifest.json and "
+                   "defs/ beside each other), then re-run; `measure coverage` "
+                   "names what failed",
+        ))
+    print(f"MEASURED {stats.defs_inserted} defs built from {dump} "
+          f"({detail}) via dumpdb.build")
     return 0
 
 
@@ -108,8 +158,7 @@ def cmd_types(args) -> int:
         for t, cov, loaded, declared in rows[: args.rows]:
             print(f"{t:44s} {cov:9s} {loaded if loaded is not None else '-':>7} "
                   f"declared={declared if declared is not None else '-'}")
-        if len(rows) > args.rows:
-            print(f"... {len(rows) - args.rows} more (use --rows)")
+        _rows_footer(args.rows, len(rows))
     return emit(Measured(
         value=len(rows), instrument="dumpdb.types",
         artifact=f"types matching {args.like}" if args.like else "def types",
@@ -124,6 +173,20 @@ def cmd_coverage(args) -> int:
     complete = summary.get("complete", 0)
     total = sum(summary.values())
     bad = total - complete
+    # 🔴 NOTHING CAPTURED IS NOT PERFECT COVERAGE. With an empty `capture` table
+    # this arithmetic gave total=0, bad=0 and printed `MEASURED 0 def types
+    # complete`, exit 0 — the total absence of evidence rendered as a clean
+    # measurement, by the command whose entire job is to say what is missing.
+    if total == 0:
+        return emit(Unmeasured(
+            reason="this db holds no capture rows at all, so it cannot say what "
+                   "was or was not captured — that is ignorance, not complete "
+                   "coverage of nothing",
+            artifact="dump coverage",
+            instrument="dumpdb.coverage",
+            remedy="measure build, against the directory holding manifest.json "
+                   "and defs/",
+        ))
     detail = " ".join(f"{k}={v}" for k, v in sorted(summary.items()))
 
     def _detail():
@@ -141,8 +204,7 @@ def cmd_coverage(args) -> int:
             "WHERE coverage <> 'complete' ORDER BY declared_count DESC")
         for t, cov, dc, reason in rows[: args.rows]:
             print(f"{t:44s} {cov:9s} declared={dc} — {reason}")
-        if len(rows) > args.rows:
-            print(f"... {len(rows) - args.rows} more")
+        _rows_footer(args.rows, len(rows))
 
     if bad:
         # ⚠️ Say what each state COSTS, not just that it is not `complete`.
@@ -194,11 +256,10 @@ def cmd_find(args) -> int:
     db = _db(args)
     m = db.find(args.literal, def_type=args.type)
     if m.ok and args.rows:
-        for dtype, _full, name in getattr(m, "hits", [])[: args.rows]:
+        hits = getattr(m, "hits", [])
+        for dtype, _full, name in hits[: args.rows]:
             print("    %-30s %s" % (name, dtype))
-        extra = len(getattr(m, "hits", [])) - args.rows
-        if extra > 0:
-            print("    ... %d more (use --rows)" % extra)
+        _rows_footer(args.rows, len(hits))
     return emit(m)
 
 
@@ -256,22 +317,30 @@ def cmd_sql(args) -> int:
                    "opened read-only",
             artifact="sql", instrument="dumpdb.sql",
             right_instrument="rebuild with `measure build` if the data is wrong"))
-    if ";" in q.rstrip().rstrip(";"):
-        return emit(Refused(
-            reason="one statement at a time",
-            artifact="sql", instrument="dumpdb.sql",
-            right_instrument="run the statements separately"))
+    # ⚠️ NO SUBSTRING SEARCH FOR `;`. It was `if ";" in q.rstrip().rstrip(";")`,
+    # which cannot tell a statement separator from a semicolon inside a quoted
+    # literal — so `SELECT ';'` and `… WHERE def_name = 'a;b'` were both refused
+    # as "one statement at a time", and a refusal for a query that is perfectly
+    # single is the unearned refusal that gets an instrument routed around.
+    # sqlite is the only thing here that can actually parse SQL, so it judges:
+    # `Connection.execute` raises `You can only execute one statement at a time`
+    # and executes NOTHING when handed two (and the db is opened read-only
+    # regardless).
     try:
         rows = db.sql(q)
     except Exception as ex:
+        if "one statement at a time" in str(ex):
+            return emit(Refused(
+                reason="one statement at a time",
+                artifact="sql", instrument="dumpdb.sql",
+                right_instrument="run the statements separately"))
         return emit(Unmeasured(
             reason=str(ex), artifact="sql", instrument="dumpdb.sql",
             remedy="fix the query, or `measure build` if the db is stale"))
     limit = args.rows or 20
     for r in rows[:limit]:
         print("\t".join("" if c is None else str(c) for c in r))
-    if len(rows) > limit:
-        print(f"... {len(rows) - limit} more (use --rows)")
+    _rows_footer(limit, len(rows))
     print(f"RAW {len(rows)} row(s) from a read-only query @ {db.against} — "
           f"NOT a measurement: raw rows carry no coverage, so a 0 here may mean "
           f"'not captured'. Use `count`/`coverage` for an answer you can quote.")
@@ -296,11 +365,7 @@ def cmd_csv(args) -> int:
     # re-emitted every time the planet is repainted. sha256 over the whole file is
     # affordable here precisely because these are ~1.7 MB; ⛔ do not copy this to
     # the def dump, where it would be a 646 MB read per question.
-    digest = _hashlib.sha256()
-    with open(path, "rb") as fh:
-        for chunk in iter(lambda: fh.read(1 << 20), b""):
-            digest.update(chunk)
-    fingerprint = digest.hexdigest()[:16]
+    fingerprint = _file_sha256(path)
 
     with open(path, newline="", encoding="utf-8") as fh:
         rd = _csv.DictReader(fh)

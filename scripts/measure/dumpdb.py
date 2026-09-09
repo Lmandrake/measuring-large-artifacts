@@ -6,9 +6,10 @@ is one number that costs no parsing and no context. The price, accepted openly,
 is that the dump stops being diffable and greppable.
 
 ⚠️ **Both formats are written for one capture cycle.** This module never deletes
-the JSON. `verify_against_json()` re-reads the source and checks it row for row;
-the JSON stops being written only when they have agreed on a real capture. A
-format migration that is also a trust migration is not a single step.
+the JSON. `verify_against_json()` re-reads the source and checks the two against
+each other PER SLICE — it re-parses every record and compares the counts, not the
+fields — and the JSON stops being written only when they have agreed on a real
+capture. A format migration that is also a trust migration is not a single step.
 
 The schema exists to make the failures that happened IMPOSSIBLE rather than
 unlikely:
@@ -243,8 +244,14 @@ def read_manifest(path):
     Returns (manifest, declared_order) where declared_order maps a simple type
     name to the list of counts written under it, IN WRITE ORDER. A list longer
     than one is a collision, and everything but the last entry was lost.
+
+    ⚠️ `utf-8-sig`, matching `iter_defs`. The same producer writes both files, so
+    a BOM habit reaches the manifest too — and a BOM here raised
+    `json.JSONDecodeError` out of `build()` uncaught, killing the whole build for
+    a file the reader on the other side of this module handles routinely. Two
+    readers of one producer's output must not disagree about its encoding.
     """
-    with open(path, "r", encoding="utf-8") as fh:
+    with open(path, "r", encoding="utf-8-sig") as fh:
         manifest = json.loads(fh.read(), object_pairs_hook=_pairs_hook)
     order = {}
     dc = manifest.get("defCounts")
@@ -406,6 +413,50 @@ def _walk(buf, fh, window):
         idx = end
 
 
+class _DefIter:
+    """The record stream, WITH an owner for the open file handle.
+
+    🔴 It is a class and not a generator because of a measured leak. The old
+    generator closed the file in its own `finally`, which only ever runs if the
+    generator was STARTED — and `build`'s collision branch decides a file is
+    shadowed from the header alone and `continue`s without reading one record.
+    An un-started generator's `close()` runs no code at all, so the handle
+    survived to garbage collection: one leaked fd per collision (13 on the real
+    dump), and on Windows an open handle is also what makes the producer's
+    `os.replace` of that same file fail.
+
+    ⇒ Whoever abandons the stream calls `close()`, and it works whether or not a
+    single record was ever read.
+    """
+
+    __slots__ = ("_fh", "_it")
+
+    def __init__(self, fh, rest, gen_fh, gen_window):
+        self._fh = fh
+        self._it = _walk(rest, gen_fh, gen_window)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        try:
+            return next(self._it)
+        except BaseException:
+            # Exhaustion AND damage both end the read. A truncated file raises
+            # here, and `build` records it as COVERAGE_FAILED rather than dying —
+            # so the handle has to be released on the way past.
+            self.close()
+            raise
+
+    def close(self):
+        fh, self._fh = self._fh, None
+        if fh is not None:
+            fh.close()
+
+    def __del__(self):                       # pragma: no cover - a safety net
+        self.close()
+
+
 class _StringSource:
     """Makes an already-read `str` look like the text stream `_read_header`
     wants, so the reference reader shares that logic instead of copying it."""
@@ -428,7 +479,8 @@ def iter_defs(path, window=WINDOW):
     a shadowed file from an honest one: the `defType` INSIDE the file is
     authoritative, the filename is not.
 
-    Returns (header, generator of (def_object, source_span)).
+    Returns (header, an iterator of (def_object, source_span) that owns the file
+    handle and can be `close()`d by a caller who reads none of it).
 
     `window=None` selects the **reference reader**, which reads the whole file
     into one `str` exactly as every version before 2026-08-31 did. It is kept,
@@ -451,21 +503,14 @@ def iter_defs(path, window=WINDOW):
         fh.close()
         raise
 
-    def gen():
-        # 🔴 The handle is closed by the GENERATOR, not by a `with` around the
-        # header parse. The old reader could use `with` because it had already
-        # read the whole file before yielding anything; this one is still reading
-        # while the caller iterates, and `build` abandons the generator on a
-        # shadowed or damaged file. Without this `finally`, every abandoned file
-        # leaked a descriptor until GC — 536 files per build, and on Windows an
-        # open handle is also what makes the final `os.replace` fail.
-        try:
-            for pair in _walk(rest, gen_fh, gen_window):
-                yield pair
-        finally:
-            fh.close()
-
-    return header, gen()
+    # 🔴 The handle is owned by the ITERATOR, not by a `with` around the header
+    # parse. The old reader could use `with` because it had already read the
+    # whole file before yielding anything; this one is still reading while the
+    # caller iterates, and `build` abandons the stream on a shadowed or damaged
+    # file. Without an owner, every abandoned file leaked a descriptor until GC —
+    # 536 files per build, and on Windows an open handle is also what makes the
+    # final `os.replace` fail.
+    return header, _DefIter(fh, rest, gen_fh, gen_window)
 
 
 # --------------------------------------------------------------------------
@@ -598,6 +643,12 @@ def build(dump_dir: str, db_path: str = None, only=None, progress=None,
                  COVERAGE_FAILED, f"cannot read: {ex}"),
             )
             stats.failed += 1
+            # ⚠️ A capture row was written, so this type WAS seen. Leaving
+            # types_seen alone here made `provenance.types_captured` disagree
+            # with the rows in `capture` — the mid-iteration failure branch
+            # below counts it and this one did not, so the same damage told two
+            # different stories depending on where it surfaced.
+            stats.types_seen += 1
             continue
 
         inner_type = header.get("defType") or stem
@@ -634,10 +685,8 @@ def build(dump_dir: str, db_path: str = None, only=None, progress=None,
             # capture that HAD recorded which records belong to which, deleted
             # both slices, and reported them in the build total anyway — 630
             # AbilityDefs on disk, 0 in the table. Measured 2026-08-21.
-            n_gone = con.execute(
-                "SELECT COUNT(*) FROM defs WHERE def_type = ?",
-                (inner_type,)).fetchone()[0]
-            con.execute("DELETE FROM defs WHERE def_type = ?", (inner_type,))
+            it.close()          # nothing will be read from it; see _DefIter
+            n_gone = _drop_type(con, inner_type)
             stats.defs_inserted -= n_gone     # never report rows we just removed
             con.execute(
                 "INSERT OR REPLACE INTO capture VALUES (?,?,?,?,?,?,?,?,?)",
@@ -656,7 +705,16 @@ def build(dump_dir: str, db_path: str = None, only=None, progress=None,
         # is a declaration by a better route than defCounts — so an indexed file
         # is never an orphan even when defCounts is keyed on the other string.
         if not entry and inner_type not in declared_order and stem not in declared_order:
-            n = sum(1 for _ in it)          # counted, so the refusal can say how many
+            # ⚠️ Do NOT re-parse a leftover just to say how big it is. On the
+            # real dump an orphan can be 300 MB and NOTHING is loaded from it,
+            # so the file's own trailing `count` answers "how many" for free —
+            # and the refusal below quotes it AS the file's claim, never as a
+            # parse. Only when the file declares nothing is it walked.
+            if file_count is None:
+                n = sum(1 for _ in it)      # counted, so the refusal can say how many
+            else:
+                it.close()
+                n = None
             cov, reason = _coverage(inner_type, stem, declared_order, file_count, n)
             con.execute(
                 "INSERT OR REPLACE INTO capture VALUES (?,?,?,?,?,?,?,?,?)",
@@ -719,7 +777,7 @@ def build(dump_dir: str, db_path: str = None, only=None, progress=None,
                 (key, inner_type, full_name, fname, declared_here,
                  file_count, n, COVERAGE_FAILED,
                  f"read failed after {n} defs: {ex}"))
-            con.execute("DELETE FROM defs WHERE def_type = ?", (inner_type,))
+            _drop_type(con, inner_type)
             stats.failed += 1
             stats.types_seen += 1
             seen_types[key] = fname
@@ -803,6 +861,28 @@ def build(dump_dir: str, db_path: str = None, only=None, progress=None,
     return stats
 
 
+def _drop_type(con, def_type):
+    """Remove a slice's defs AND everything that hangs off them. -> rows gone.
+
+    🔴 EVERYTHING, not just `defs`. The two repair paths in `build` deleted the
+    defs rows of a slice they had just refused to vouch for and left the
+    `def_tags` / `def_flags` rows pointing at ids that no longer exist — and
+    `tag()` and `flag()` count those tables directly. Measured on a synthetic
+    collision: 6 orphaned `def_tags` rows, and `measure tag OnlyBroken` answering
+    **MEASURED 3** about records that are not in the database at all. A refusal
+    that leaves its evidence behind is not a refusal.
+
+    The count comes from the DELETE's own rowcount; the old code ran a
+    `SELECT COUNT(*)` first, which is a second scan of an unindexed column in
+    the middle of the load for a number sqlite already reports.
+    """
+    ids = "SELECT id FROM defs WHERE def_type = ?"
+    con.execute("DELETE FROM def_tags WHERE def_id IN (%s)" % ids, (def_type,))
+    con.execute("DELETE FROM def_flags WHERE def_id IN (%s)" % ids, (def_type,))
+    return con.execute("DELETE FROM defs WHERE def_type = ?",
+                       (def_type,)).rowcount
+
+
 def _flagval(v):
     if isinstance(v, bool):
         return "true" if v else "false"
@@ -854,12 +934,18 @@ def _coverage(inner_type, stem, declared_order, file_count, loaded,
 
     written = declared_order.get(inner_type)
     if written is None:
+        # `loaded is None` means the file was not walked — see the orphan branch
+        # in `build`. Then the number quoted is the FILE'S OWN CLAIM and says so,
+        # because presenting a declaration as a parse is the substitution this
+        # whole package exists to stop.
+        held = (f"Its {loaded} defs are NOT loaded"
+                if loaded is not None
+                else f"The {file_count} defs it declares are NOT loaded")
         return COVERAGE_ORPHAN, (
             f"defs/{stem}.json exists but this capture's manifest never "
             f"declared it — a leftover from an earlier dump, since defs/ "
-            f"accumulates and is never pruned. Its {loaded} defs are NOT "
-            f"loaded: a dead defName in the index makes a patch referencing a "
-            f"REMOVED def validate clean."
+            f"accumulates and is never pruned. {held}: a dead defName in the "
+            f"index makes a patch referencing a REMOVED def validate clean."
         )
     if len(written) > 1:
         lost = sum(written[:-1])
@@ -1004,6 +1090,51 @@ class DumpDB:
     def close(self):
         self.con.close()
 
+    # ---- coverage attribution, shared by every row-level answer ----------
+    #: Coverage states whose records this capture can actually vouch for. The
+    #: pair `record()` uses, and for the same reason: handing back a row implies
+    #: "and this is the whole story".
+    _VOUCHABLE = (COVERAGE_COMPLETE, COVERAGE_AMBIGUOUS)
+
+    def _attribution(self, def_type: str = None):
+        """-> (cov(def_type, full_name) -> coverage|None, blind, slices in scope).
+
+        🔑 ONE implementation, because every row-level answer needs the same
+        judgement and three hand-rolled copies is how they drifted: `find`
+        gated its zero, `get` did not gate at all, and `tag` counted rows whose
+        defs had been deleted.
+
+        ⚠️ Coverage cannot simply be joined on `def_type`: a RESOLVED collision
+        puts two capture rows under one simple name, so the join would double
+        every hit. Attribute by full name first, fall back to the simple name
+        only when it names exactly one coverage state, and treat anything else
+        as unattributable — a refusal to vouch, not a pass.
+
+        `blind` is the number of slices IN SCOPE that cannot be searched at all.
+        ⭐ Scoped, not global: `find X --type ThingDef` over a complete ThingDef
+        used to be refused because some unrelated type was truncated, which is
+        an unearned refusal, and unearned refusals get the instrument bypassed.
+        """
+        cov_rows = self.con.execute(
+            "SELECT def_type, full_name, coverage, capture_key FROM capture"
+        ).fetchall()
+        by_full = {f: c for _t, f, c, _k in cov_rows if f}
+        by_type = {}
+        for t, _f, c, _k in cov_rows:
+            by_type.setdefault(t, set()).add(c)
+
+        def cov(dtype, full):
+            if full and full in by_full:
+                return by_full[full]
+            states = by_type.get(dtype) or set()
+            return next(iter(states)) if len(states) == 1 else None
+
+        in_scope = [r for r in cov_rows
+                    if def_type is None
+                    or def_type in (r[0], r[1], r[3])]
+        blind = sum(1 for r in in_scope if r[2] not in self._VOUCHABLE)
+        return cov, blind, len(in_scope)
+
     # ---- the question that started this ---------------------------------
     def count(self, def_type: str):
         """How many defs of this type. `0` here can only mean measured zero."""
@@ -1068,12 +1199,6 @@ class DumpDB:
                 remedy="re-capture with a producer that keys on the "
                        "fully-qualified type name, then `measure build`",
             )
-        m = Measured(
-            value=loaded,
-            instrument="dumpdb.count",
-            artifact=def_type,
-            against=self.against,
-        )
         if coverage == COVERAGE_PARTIAL:
             return Unmeasured(
                 reason=f"coverage=partial: {reason}",
@@ -1082,7 +1207,12 @@ class DumpDB:
                 remedy="the file is truncated or the manifest disagrees; "
                        "re-capture before trusting a number here",
             )
-        return m
+        return Measured(
+            value=loaded,
+            instrument="dumpdb.count",
+            artifact=def_type,
+            against=self.against,
+        )
 
     def types(self, like: str = None):
         q = "SELECT def_type, coverage, loaded_count, declared_count FROM capture"
@@ -1098,14 +1228,39 @@ class DumpDB:
             "SELECT coverage, COUNT(*) FROM capture GROUP BY coverage"))
 
     def get(self, def_name: str):
+        """Does this defName exist, and as what — COVERAGE-GATED, like the rest.
+
+        🔴 It used to answer from the rows alone. A def sitting in a `partial`
+        slice therefore came back `MEASURED 1` from the same db, in the same
+        second, in which `count` on its type refused and `record` on the def
+        itself refused — one artifact, three answers, and the confident one was
+        the cheapest to reach. Its remedy text had always ADVISED running
+        `coverage` first; advice is not a gate.
+        """
         stale = self._guard(def_name)
         if stale:
             return stale
         rows = self.con.execute(
-            "SELECT def_type, label, mod_name, package_id, short_hash "
+            "SELECT def_type, label, mod_name, package_id, short_hash, full_name "
             "FROM defs WHERE def_name = ?", (def_name,)
         ).fetchall()
-        if not rows:
+        cov, blind, _scope = self._attribution()
+        solid = [r for r in rows if cov(r[0], r[5]) in self._VOUCHABLE]
+        murky = len(rows) - len(solid)
+        if not solid:
+            if murky or blind:
+                return Unmeasured(
+                    reason=(f"{murky} record(s) carry this name but sit in slices "
+                            f"this capture cannot vouch for"
+                            if murky else
+                            f"no record with this name, and {blind} slice(s) are "
+                            f"shadowed, absent, failed, partial or orphaned — so "
+                            f"this is 'not found where I could look'"),
+                    artifact=def_name,
+                    instrument="dumpdb.get",
+                    remedy="`measure coverage --rows 20` names the slices; "
+                           "re-capture before concluding anything from this",
+                )
             return Unmeasured(
                 reason="no def with this name in the capture",
                 artifact=def_name,
@@ -1113,12 +1268,16 @@ class DumpDB:
                 remedy="absence here is only as good as coverage — run "
                        "`coverage` first and check the type is complete",
             )
+        evidence = "; ".join(f"{r[0]} '{r[1]}' from {r[2]}" for r in solid[:3])
+        if murky:
+            evidence += ("; %d further record(s) in slices this capture cannot "
+                         "vouch for" % murky)
         return Measured(
-            value=len(rows),
+            value=len(solid),
             instrument="dumpdb.get",
             artifact=def_name,
             against=self.against,
-            evidence="; ".join(f"{r[0]} '{r[1]}' from {r[2]}" for r in rows[:3]),
+            evidence=evidence,
         )
 
     def tag(self, tag: str, kind: str = "weaponTags"):
@@ -1132,10 +1291,47 @@ class DumpDB:
         stale = self._guard(f"{kind}:{tag}")
         if stale:
             return stale
-        n = self.con.execute(
-            "SELECT COUNT(DISTINCT def_id) FROM def_tags WHERE kind=? AND tag=?",
+        # ⚠️ `TAG_FIELDS` IS AN ALLOWLIST, so a kind that is not in it was never
+        # indexed and would answer "nothing carries that" about a field the
+        # builder simply does not read. That is inability, not evidence — and it
+        # is the one case where naming the alternative is trivial.
+        if kind not in TAG_FIELDS:
+            return Refused(
+                reason=f"{kind} is not one of the list-valued fields this build "
+                       f"indexes, so nothing was ever written for it",
+                artifact=f"{kind}:{tag}", instrument="dumpdb.tag",
+                right_instrument="one of " + ", ".join(sorted(TAG_FIELDS))
+                                 + "; for any other field, `measure find "
+                                   "<literal>` searches the stored records",
+            )
+        # 🔴 A JOIN, and coverage-gated exactly like `count`. Counting `def_tags`
+        # alone counted rows whose defs are not in the database — a slice this
+        # build refused to vouch for leaves its tag rows behind unless every
+        # deletion path cleans them (`_drop_type`), and even a clean one must not
+        # let a `partial` slice's tags mint a confident number that `count` on
+        # the same type refuses.
+        cov, blind, _scope = self._attribution()
+        rows = self.con.execute(
+            "SELECT DISTINCT d.id, d.def_type, d.full_name FROM def_tags t "
+            "JOIN defs d ON d.id = t.def_id WHERE t.kind=? AND t.tag=?",
             (kind, tag),
-        ).fetchone()[0]
+        ).fetchall()
+        solid = [r for r in rows if cov(r[1], r[2]) in self._VOUCHABLE]
+        n = len(solid)
+        murky = len(rows) - n
+        if n == 0 and murky:
+            # Rows exist and cannot be attributed — that is missing evidence,
+            # which is UNMEASURED. Zero rows anywhere is a different question and
+            # keeps its refusal below, because the neutering caveat applies to it
+            # however good the coverage is.
+            return Unmeasured(
+                reason=f"{murky} def(s) carry {tag} but sit in slices this "
+                       f"capture cannot vouch for",
+                artifact=f"{kind}:{tag}",
+                instrument="dumpdb.tag",
+                remedy="`measure coverage --rows 20` names the slices; "
+                       "re-capture before concluding the tag is dead",
+            )
         if n == 0:
             known = self.con.execute(
                 "SELECT COUNT(*) FROM def_tags WHERE kind=?", (kind,)
@@ -1151,7 +1347,9 @@ class DumpDB:
             return Refused(
                 reason=f"zero defs carry {tag}, but a cut def is NEUTERED and "
                        f"not deleted, so 'no rows' cannot distinguish "
-                       f"'never existed' from 'cut to nothing'",
+                       f"'never existed' from 'cut to nothing'"
+                       + (f" — and {blind} slice(s) could not be searched at all"
+                          if blind else ""),
                 artifact=f"{kind}:{tag}",
                 instrument="dumpdb.tag",
                 right_instrument="cross-check against the Cherry Picker key "
@@ -1160,16 +1358,25 @@ class DumpDB:
         return Measured(
             value=n, instrument="dumpdb.tag",
             artifact=f"{kind}:{tag}", against=self.against,
+            evidence=("%d further def(s) in slices this capture cannot vouch for"
+                      % murky) if murky else "",
         )
 
     def flag(self, key: str, value: str = "true"):
         stale = self._guard(f"is.{key}={value}")
         if stale:
             return stale
-        n = self.con.execute(
-            "SELECT COUNT(DISTINCT def_id) FROM def_flags WHERE key=? AND value=?",
+        # Same join and same gate as `tag` — see there for why counting the
+        # side table on its own is a confident wrong number waiting to happen.
+        cov, blind, _scope = self._attribution()
+        rows = self.con.execute(
+            "SELECT DISTINCT d.id, d.def_type, d.full_name FROM def_flags f "
+            "JOIN defs d ON d.id = f.def_id WHERE f.key=? AND f.value=?",
             (key, value),
-        ).fetchone()[0]
+        ).fetchall()
+        solid = [r for r in rows if cov(r[1], r[2]) in self._VOUCHABLE]
+        n = len(solid)
+        murky = len(rows) - n
         known = self.con.execute(
             "SELECT COUNT(*) FROM def_flags WHERE key=?", (key,)
         ).fetchone()[0]
@@ -1180,16 +1387,28 @@ class DumpDB:
                 instrument="dumpdb.flag",
                 remedy="only ThingDefs carry the `is` block; check the type",
             )
+        if n == 0 and (murky or blind):
+            return Unmeasured(
+                reason=(f"{murky} def(s) are classified {key}={value} but sit in "
+                        f"slices this capture cannot vouch for"
+                        if murky else
+                        f"no def this capture can vouch for is classified "
+                        f"{key}={value}, and {blind} slice(s) are shadowed, "
+                        f"absent, failed, partial or orphaned"),
+                artifact=f"is.{key}={value}",
+                instrument="dumpdb.flag",
+                remedy="`measure coverage --rows 20` names the slices; "
+                       "re-capture before quoting a number here",
+            )
+        evidence = f"of {known} defs carrying the flag"
+        if murky:
+            evidence += ("; %d further def(s) in slices this capture cannot "
+                         "vouch for" % murky)
         return Measured(
             value=n, instrument="dumpdb.flag",
             artifact=f"is.{key}={value}", against=self.against,
-            evidence=f"of {known} defs carrying the flag",
+            evidence=evidence,
         )
-
-    #: Coverage states whose records this capture can actually vouch for. The
-    #: same pair `record()` uses, and for the same reason: handing back a hit
-    #: implies "and this is the whole story".
-    _VOUCHABLE = (COVERAGE_COMPLETE, COVERAGE_AMBIGUOUS)
 
     def find(self, literal: str, def_type: str = None):
         """Does this exact string occur in the dump, and in how many records?
@@ -1251,29 +1470,26 @@ class DumpDB:
             args += [def_type, def_type]
         rows = self.con.execute(q, args).fetchall()
 
-        # ⚠️ Coverage cannot be joined on `def_type`: a RESOLVED collision puts
-        # two capture rows under one simple name, so the join would double every
-        # hit. Attribute by full name first, fall back to the simple name only
-        # when it names exactly one slice, and treat anything else as
-        # unattributable — which is a refusal to vouch, not a pass.
-        cov_rows = self.con.execute(
-            "SELECT def_type, full_name, coverage FROM capture").fetchall()
-        by_full = {f: c for _t, f, c in cov_rows if f}
-        by_type = {}
-        for t, _f, c in cov_rows:
-            by_type.setdefault(t, set()).add(c)
-
-        def _cov(dtype, full):
-            if full and full in by_full:
-                return by_full[full]
-            states = by_type.get(dtype) or set()
-            return next(iter(states)) if len(states) == 1 else None
-
-        solid = [r for r in rows if _cov(r[0], r[1]) in self._VOUCHABLE]
+        # Attribution and the blind-slice count are `_attribution`'s job now —
+        # `get`, `tag` and `flag` need exactly the same judgement, and three
+        # copies of it is how they drifted apart in the first place.
+        cov, blind, n_scope = self._attribution(def_type)
+        if def_type and not n_scope:
+            # ⚠️ A scope nothing matches is not an empty search space, it is a
+            # question about a type this capture never heard of — and answering
+            # `MEASURED 0` there would be a measured absence from a slice that
+            # was never even a slice. A typo in `--type` must not read as a
+            # finding.
+            return Unmeasured(
+                reason=f"no def type named {def_type} in this capture, so a "
+                       f"search scoped to it has nothing to look in",
+                artifact="find %r" % literal,
+                instrument="dumpdb.find",
+                remedy="check the spelling with `measure types <substring>`, or "
+                       "drop --type to search the whole capture",
+            )
+        solid = [r for r in rows if cov(r[0], r[1]) in self._VOUCHABLE]
         murky = len(rows) - len(solid)
-        blind = self.con.execute(
-            "SELECT COUNT(*) FROM capture WHERE coverage NOT IN (?,?)",
-            self._VOUCHABLE).fetchone()[0]
 
         # ⚠️ SAY WHEN THE LIST IS TRUNCATED. The first cut printed the first
         # three types and stopped, so `find 'café'` read "MEASURED 7 (in
@@ -1291,14 +1507,26 @@ class DumpDB:
             ev += "; %d further hit(s) in slices this capture cannot vouch for" % murky
 
         if not solid:
-            if blind:
+            # 🔴 `murky` REFUSES TOO, and gating on `blind` alone was a confident
+            # wrong zero. `murky` counts hits whose slice could not be
+            # ATTRIBUTED — a simple name carrying two coverage states, say — and
+            # those hits can exist while every capture row is complete or
+            # ambiguous, i.e. while `blind` is 0. Measured on a synthetic:
+            # `find ZZUNIQUE` returned **MEASURED 0 … every slice in this capture
+            # is complete, so this is a measured absence** with the string
+            # sitting in a record. Hits found and hits vouched for are different
+            # numbers; only the second may render as an answer.
+            if blind or murky:
                 return Unmeasured(
                     reason=f"no record this capture can vouch for contains "
-                           f"{literal!r}, but {blind} slice(s) are shadowed, "
-                           f"absent, failed or orphaned — so this is 'not found "
-                           f"where I could look', not 'not present'"
-                           + (f" ({murky} hit(s) fell in those slices)" if murky
-                              else ""),
+                           f"{literal!r}"
+                           + (f", but {murky} hit(s) fall in slices it cannot "
+                              f"attribute" if murky else "")
+                           + (f", and {blind} slice(s) in scope are shadowed, "
+                              f"absent, failed, partial or orphaned" if blind
+                              else "")
+                           + " — so this is 'not found where I could look', "
+                             "not 'not present'",
                     artifact="find %r" % literal,
                     instrument="dumpdb.find",
                     remedy="`measure coverage --rows 20` names the slices that "
@@ -1307,8 +1535,8 @@ class DumpDB:
             return Measured(
                 value=0, instrument="dumpdb.find",
                 artifact="find %r" % literal, against=self.against,
-                evidence="every slice in this capture is complete, so this is a "
-                         "measured absence"
+                evidence=("every slice in scope is complete and every hit "
+                          "attributable, so this is a measured absence")
                          + ("; %d encoded forms searched" % len(forms)
                             if len(forms) > 1 else ""),
             )
@@ -1375,9 +1603,16 @@ class DumpDB:
         n = self.count(def_type)
         if not n.ok:
             return n
+        # ⚠️ TWO placeholders means TWO bindings. A dotted name — the ONLY way to
+        # ask for one side of a resolved collision, and therefore the reason this
+        # branch exists — bound one, so `records('Verse.AbilityDef')` died with
+        # `sqlite3.ProgrammingError: Incorrect number of bindings supplied`. The
+        # sibling branch in `count` binds the pair correctly, which is exactly
+        # how it went unnoticed.
+        dotted = "." in def_type
         q = ("SELECT json FROM defs WHERE def_type = ? OR full_name = ?"
-             if "." in def_type else "SELECT json FROM defs WHERE def_type = ?")
-        args = (def_type,)
+             if dotted else "SELECT json FROM defs WHERE def_type = ?")
+        args = (def_type, def_type) if dotted else (def_type,)
         if limit:
             q += " LIMIT ?"
             args += (limit,)
@@ -1402,9 +1637,16 @@ class DumpDB:
 
     # ---- the trust migration -------------------------------------------
     def verify_against_json(self, dump_dir: str, limit_types=None) -> Report:
-        """Re-read the JSON and check the db row for row.
+        """Re-read the JSON and check the db against it, slice by slice.
 
         This is what makes writing both formats for one cycle mean something.
+
+        ⚠️ WHAT IT COMPARES, EXACTLY: every record in every file is re-parsed,
+        and the resulting COUNT is checked against the database's count for that
+        slice. It does not compare record fields, so it catches a lost, dropped
+        or duplicated record and not a corrupted one — `t_a_stored_record_is_
+        what_the_producer_WROTE` in the selftest is what covers the bytes. The
+        docs said "record by record", which promised the second thing.
         """
         rep = Report()
         defs_dir = os.path.join(dump_dir, "defs")
@@ -1424,6 +1666,16 @@ class DumpDB:
                 "SELECT source_file, full_name, coverage FROM capture "
                 "WHERE source_file IS NOT NULL"):
             by_file[src] = (full, cov)
+
+        # 🔑 ONE aggregate each, before the loop. The old shape ran a
+        # `SELECT COUNT(*) … WHERE full_name = ?` per file, and `full_name`
+        # carries no index — 500-odd full scans of the biggest table in the
+        # database to answer a question one GROUP BY answers.
+        n_by_full = dict(self.con.execute(
+            "SELECT full_name, COUNT(*) FROM defs WHERE full_name IS NOT NULL "
+            "GROUP BY full_name"))
+        n_by_type = dict(self.con.execute(
+            "SELECT def_type, COUNT(*) FROM defs GROUP BY def_type"))
 
         for fname in sorted(os.listdir(defs_dir)):
             if not fname.endswith(".json"):
@@ -1454,14 +1706,7 @@ class DumpDB:
                 # json-vs-sqlite disagreement would send the reader to
                 # "rebuild the db", which cannot and must not change it.
                 continue
-            if full:
-                db_n = self.con.execute(
-                    "SELECT COUNT(*) FROM defs WHERE full_name = ?", (full,)
-                ).fetchone()[0]
-            else:
-                db_n = self.con.execute(
-                    "SELECT COUNT(*) FROM defs WHERE def_type = ?", (inner,)
-                ).fetchone()[0]
+            db_n = n_by_full.get(full, 0) if full else n_by_type.get(inner, 0)
             if n == db_n:
                 rep.add(Measured(value=n, instrument="verify_against_json",
                                  artifact=inner, against=self.against))

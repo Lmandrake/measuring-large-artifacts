@@ -91,9 +91,11 @@ not a positional. It **refuses by default when the def dump predates the log**,
 because a dump from an earlier run cannot explain this one; `--stale-ok`
 overrides that when you have read the refusal and disagree.
 
-⚠️ There is no `measure` command for logs yet. Until there is, "how many errors"
-has no trustworthy answer here — `harvest_log.py` groups traces, but the honest
-move is to answer the narrower question ("did X occur") rather than a count.
+⇒ `measure count-errors <path> [--top N]` — how many DISTINCT errors, as a
+Measurement. It groups stack traces structurally, masks filenames and numbers
+before deciding two openers are the same fault, reports occurrences alongside
+distinct, and returns UNMEASURED (never 0) for a file that carries no RimWorld
+signature. `harvest_log.py` is still the triage report; this is the count.
 
 ## World CSVs — `world/*.csv`
 
