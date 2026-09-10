@@ -41,7 +41,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from measure.result import (Measured, Unmeasured, Refused, Report,
                             UnmeasuredError)  # noqa: E402
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 DB_NAME = "defs.sqlite"
 
 SCHEMA = """
@@ -96,7 +96,28 @@ CREATE TABLE defs (
     -- The record's own reported class, when it differs. Real information, but a
     -- different question, so it gets its own column.
     concrete_type TEXT,
+    -- 🔴 THE SLICE'S DECLARED FULL TYPE — the namespace-qualified form of
+    -- def_type, and NOT the record's own. It was `d.get("defTypeFull") or
+    -- full_name`, i.e. exactly the bug the def_type/concrete_type split above
+    -- already fixed, committed a second time one column to the right: every
+    -- record of `defs/CreepJoinerBaseDef.json` reports
+    -- `Verse.CreepJoinerAggressiveDef`, so a lookup keyed on the file's declared
+    -- `Verse.CreepJoinerBaseDef` matched NOTHING. Measured 2026-09-09 on the
+    -- live dump: 4 types scattered to zero (CreepJoinerBaseDef 24 -> 0,
+    -- FaceTypeDef 150 -> 0, IdeoSymbolPartDef 223 -> 0, PsychicRitualDef
+    -- 16 -> 0) and 24 more leaking part of their rows (ThingDef 25812 -> 25403).
     full_name  TEXT,
+    -- The record's OWN defTypeFull, when it differs from the slice's. The
+    -- namespace-qualified twin of concrete_type, and a different question for
+    -- the same reason: "which subclass is this record" is not "which slice is
+    -- it in".
+    -- ⛔ NO QUERY HOOK, DELIBERATELY. `count`, `records` and `find --type` all
+    -- mean "this slice", and a second command that looked the same and answered
+    -- about subclasses would re-create the confusion this column exists to end.
+    -- A subclass census is `measure sql`, which is labelled RAW and refuses to
+    -- vouch — correctly, since a subclass spans slices and carries no coverage
+    -- of its own.
+    concrete_full_name TEXT,
     label      TEXT,
     mod_name   TEXT,
     package_id TEXT,
@@ -733,12 +754,20 @@ def build(dump_dir: str, db_path: str = None, only=None, progress=None,
                 n += 1
                 fields = d.get("fields") or {}
                 concrete = d.get("defType")
+                # 🔴 THE SLICE'S full_name, NOT THE RECORD'S — see the schema.
+                # `d.get("defTypeFull") or full_name` scattered a slice across
+                # its records' subclass names, and every full_name-keyed lookup
+                # (verify, `count Verse.X`, `find --type Verse.X`) then answered
+                # about a fraction of the slice, or about none of it.
+                concrete_full = d.get("defTypeFull")
                 rows.append((
                     did,
                     d.get("defName") or "",
                     inner_type,
                     concrete if concrete and concrete != inner_type else None,
-                    d.get("defTypeFull") or full_name,
+                    full_name,
+                    concrete_full if concrete_full and concrete_full != full_name
+                    else None,
                     d.get("label"),
                     d.get("modName"),
                     d.get("packageId"),
@@ -899,7 +928,7 @@ def _tagval(v):
 
 def _flush(con, rows, flagrows, tagrows):
     if rows:
-        con.executemany("INSERT INTO defs VALUES (?,?,?,?,?,?,?,?,?,?)", rows)
+        con.executemany("INSERT INTO defs VALUES (?,?,?,?,?,?,?,?,?,?,?)", rows)
     if flagrows:
         con.executemany("INSERT INTO def_flags VALUES (?,?,?)", flagrows)
     if tagrows:

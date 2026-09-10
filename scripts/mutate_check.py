@@ -146,6 +146,16 @@ MUTATIONS = [
         "get_is_coverage_gated_exactly_like_count_and_record",
     ),
     (
+        "a slice's full_name is overwritten by its records' subclass",
+        "measure/dumpdb.py",
+        "                    full_name,\n"
+        "                    concrete_full if concrete_full and concrete_full != full_name\n"
+        "                    else None,",
+        "                    concrete_full or full_name,\n"
+        "                    None,",
+        "a_slices_full_name_is_the_slices_not_its_records",
+    ),
+    (
         "records() binds one argument to two placeholders",
         "measure/dumpdb.py",
         "        args = (def_type, def_type) if dotted else (def_type,)",

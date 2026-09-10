@@ -1945,6 +1945,61 @@ def t_types_captured_counts_every_capture_row_a_file_wrote():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def t_a_slices_full_name_is_the_slices_not_its_records():
+    """🔴 The def_type/concrete_type split, committed again one column right.
+
+    `full_name` was written as `d.get("defTypeFull") or full_name` — the
+    RECORD's own class in preference to the FILE's declared type. Every record
+    of `defs/CreepJoinerBaseDef.json` reports `Verse.CreepJoinerAggressiveDef`,
+    so the slice's own `Verse.CreepJoinerBaseDef` matched no row at all.
+    Measured on the live dump 2026-09-09: four types scattered to zero
+    (CreepJoinerBaseDef 24, FaceTypeDef 150, IdeoSymbolPartDef 223,
+    PsychicRitualDef 16) and 24 more leaking part of their rows — and it is what
+    made `verify` accuse a healthy capture of losing records.
+
+    The record's own name is real information, so it keeps a column of its own
+    (`concrete_full_name`) — where nothing keys a count on it.
+    """
+    tmp = tempfile.mkdtemp(prefix="measure_subcls_")
+    try:
+        _mini_dump(tmp, {"CreepJoinerBaseDef.json": _slice(
+            "CreepJoinerBaseDef",
+            [_rec("Creep%d" % i, "CreepJoinerAggressiveDef", i=i) for i in range(3)],
+            full="Verse.CreepJoinerBaseDef")}, '{"CreepJoinerBaseDef":3}',
+            def_types=('"defTypes":[{"name":"CreepJoinerBaseDef",'
+                       '"fullName":"Verse.CreepJoinerBaseDef",'
+                       '"file":"CreepJoinerBaseDef.json"}],'))
+        # every record reports the SUBCLASS as its own full type
+        p = os.path.join(tmp, "defs", "CreepJoinerBaseDef.json")
+        obj = json.load(open(p, encoding="utf-8"))
+        for d in obj["defs"]:
+            d["defTypeFull"] = "Verse.CreepJoinerAggressiveDef"
+        json.dump(obj, open(p, "w", encoding="utf-8"), separators=(",", ":"))
+
+        build(tmp)
+        db = DumpDB(os.path.join(tmp, DB_NAME))
+        try:
+            stored = db.sql("SELECT DISTINCT full_name, concrete_full_name, "
+                            "concrete_type FROM defs")
+            assert stored == [("Verse.CreepJoinerBaseDef",
+                               "Verse.CreepJoinerAggressiveDef",
+                               "CreepJoinerAggressiveDef")], stored
+            got = db.records("Verse.CreepJoinerBaseDef")
+            assert got.ok and len(got.unwrap()) == 3, (
+                "the slice's own full name does not reach its records: %s"
+                % got.line())
+            hit = db.find("Creep1", def_type="Verse.CreepJoinerBaseDef")
+            assert hit.ok and hit.value == 1, hit.line()
+            rep = db.verify_against_json(tmp)
+            assert not rep.unmeasured, (
+                "verify accuses a healthy capture: %s"
+                % [r.line() for r in rep.unmeasured])
+        finally:
+            db.close()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def _run_cli(tmp_db=None, dump=None, *argv):
     import subprocess
     cli = os.path.join(HERE, "measure", "cli.py")
