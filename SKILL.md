@@ -102,7 +102,12 @@ mistakes that destroyed data in the incidents below.
 The short version, because it is the part people skip:
 
 - **Key on something that cannot collide.** A simple name is not unique. If two
-  things can share a key, one of them will be silently overwritten.
+  things can share a key, one of them will be silently overwritten. The same
+  rule applies to a **comparator or scorer**, not only to a stored artifact: an
+  identity key used to match two structures (a section number, an enumerator
+  letter) needs the same collision-freedom as a primary key, or unrelated items
+  sharing that key will read as agreement, or as duplicates, or as fabrication
+  — depending on which direction the collision happens to hide.
 - **Record what you did NOT capture**, per slice, as a first-class field. An
   artifact that cannot say "I don't have that" forces every reader to guess.
 - **Stamp what the artifact is an answer ABOUT** — the input set, a fingerprint,
@@ -224,11 +229,16 @@ had ever been shown a wrong implementation — so "42/42" meant *the suite ran*.
 ⇒ **Mutate the code and require the named case to notice.** Nine plausible wrong
 versions — the reader silently dropping a record, a literal search rebuilt on
 `LIKE`, an orphan's records loaded, the manifest parsed with plain `json` — each
-had to be caught by a case named in advance. `scripts/mutate_check.py`. Three
+had to be caught by a case named in advance. `scripts/mutate_check.py`. Four
 properties make it an instrument rather than a ritual: a **control run** first, so
 a suite that was already red cannot read as detection; the mutation site must match
-**exactly once**, because a mutation that applied nowhere passes everything; and an
-undetected mutation is reported as a **gap in the suite**, not a success.
+**exactly once**, because a mutation that applied nowhere passes everything; an
+undetected mutation is reported as a **gap in the suite**, not a success; and the
+mutation must be able to **reach the branch meant to catch it** — a checker's
+branch guarded by an earlier filter that already removed every input which would
+trigger it will pass every mutation fired at it and prove nothing. A mutation that
+cannot reach its target branch is the same kind of dead check as one that never
+ran at all.
 
 ### 🔴 Two optimisations, each a win, cancelling each other — measured 2026-08-31
 
